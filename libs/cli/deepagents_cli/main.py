@@ -432,6 +432,35 @@ def parse_args() -> argparse.Namespace:
     )
     add_json_output_arg(update_parser)
 
+    login_parser = subparsers.add_parser(
+        "login",
+        help="Authenticate with an AI provider",
+        add_help=False,
+    )
+    login_sub = login_parser.add_subparsers(dest="login_provider")
+    login_openai = login_sub.add_parser(
+        "openai",
+        help="Log in with a ChatGPT Plus/Pro subscription (OpenAI OAuth)",
+        add_help=False,
+    )
+    login_openai.add_argument(
+        "--headless",
+        action="store_true",
+        help="Use device-code flow instead of browser redirect (for headless environments)",
+    )
+
+    logout_parser = subparsers.add_parser(
+        "logout",
+        help="Remove stored authentication credentials",
+        add_help=False,
+    )
+    logout_sub = logout_parser.add_subparsers(dest="logout_provider")
+    logout_sub.add_parser(
+        "openai",
+        help="Remove stored ChatGPT OAuth tokens",
+        add_help=False,
+    )
+
     # Default interactive mode — argument order here determines the
     # usage line printed by argparse; keep in sync with ui.show_help().
     parser.add_argument(
@@ -1499,6 +1528,10 @@ def cli_main() -> None:
             else:
                 # No subcommand provided, show threads help screen
                 show_threads_help()
+        elif args.command == "login":
+            _execute_login(args)
+        elif args.command == "logout":
+            _execute_logout(args)
         elif args.non_interactive_message:
             # Check for optional tools before running agent (stderr so
             # --quiet piped output stays clean)
@@ -1683,6 +1716,72 @@ def cli_main() -> None:
         except NameError:
             sys.stderr.write("\n\nInterrupted\n")
         sys.exit(0)
+
+
+def _execute_login(args) -> None:
+    """Handle ``deep-agents login <provider>`` commands."""
+    provider = getattr(args, "login_provider", None)
+    if provider != "openai":
+        from rich.console import Console as _Console
+
+        _Console(stderr=True).print(
+            "[bold red]Error:[/bold red] Unknown provider. "
+            "Usage: deep-agents login openai"
+        )
+        sys.exit(1)
+
+    headless = getattr(args, "headless", False)
+    from deepagents._chatgpt_auth import login_browser, login_device
+
+    try:
+        if headless:
+            tokens = login_device()
+        else:
+            tokens = login_browser()
+    except Exception as exc:
+        from rich.console import Console as _Console
+        from rich.markup import escape
+
+        _Console(stderr=True).print(
+            f"[bold red]Login failed:[/bold red] {escape(str(exc))}"
+        )
+        sys.exit(1)
+
+    account_id = tokens.get("account_id") or "(unknown)"
+    try:
+        from rich.console import Console as _Console
+
+        _Console().print(
+            f"[bold green]Logged in to ChatGPT.[/bold green] "
+            f"Account: {account_id}\n"
+            f"Use [cyan]chatgpt:gpt-5.1-codex[/cyan] (or any "
+            f"[cyan]chatgpt:<model>[/cyan]) as your model."
+        )
+    except Exception:
+        print(f"Logged in to ChatGPT. Account: {account_id}")
+
+
+def _execute_logout(args) -> None:
+    """Handle ``deep-agents logout <provider>`` commands."""
+    provider = getattr(args, "logout_provider", None)
+    if provider != "openai":
+        from rich.console import Console as _Console
+
+        _Console(stderr=True).print(
+            "[bold red]Error:[/bold red] Unknown provider. "
+            "Usage: deep-agents logout openai"
+        )
+        sys.exit(1)
+
+    from deepagents._chatgpt_auth import delete_tokens
+
+    delete_tokens()
+    try:
+        from rich.console import Console as _Console
+
+        _Console().print("[bold green]Logged out from ChatGPT.[/bold green]")
+    except Exception:
+        print("Logged out from ChatGPT.")
 
 
 if __name__ == "__main__":
