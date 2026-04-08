@@ -10,30 +10,84 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from langchain_openai import ChatOpenAI
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "gpt-5.3-codex"
 
 
-def _build_chatcodex(**kwargs: Any):  # -> ChatOpenAI
-    """Instantiate a ``ChatOpenAI`` wired to the Codex endpoint with OAuth tokens.
+class ChatCodex(ChatOpenAI):
+    """``ChatOpenAI`` subclass that fixes system-message handling for the Codex API.
+
+    The ChatGPT Codex Responses API requires system prompts to be sent with
+    ``role: "developer"`` in the ``input`` array (like other reasoning models).
+    Upstream ``ChatOpenAI`` only performs this ``system`` → ``developer``
+    conversion for ``o``-series models and only on the Chat Completions path.
+
+    This subclass overrides ``_get_request_payload`` to convert any
+    ``system``-role items in the Responses API ``input`` to ``developer``,
+    matching what openclaw does for reasoning models.
+    """
+
+    def _get_request_payload(
+        self,
+        input_: Any,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> dict:
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        # The Codex Responses API requires the ``instructions`` top-level
+        # field.  Upstream ``ChatOpenAI`` places system messages into the
+        # ``input`` array instead.  Extract them and set ``instructions``.
+        if isinstance(payload.get("input"), list):
+            system_texts: list[str] = []
+            remaining: list[dict] = []
+            for item in payload["input"]:
+                if isinstance(item, dict) and item.get("role") in (
+                    "system",
+                    "developer",
+                ):
+                    content = item.get("content", "")
+                    if isinstance(content, str):
+                        system_texts.append(content)
+                    elif isinstance(content, list):
+                        # Content-block format: extract text parts.
+                        for block in content:
+                            if isinstance(block, dict) and block.get("type") in (
+                                "text",
+                                "input_text",
+                            ):
+                                system_texts.append(
+                                    block.get("text", "")
+                                )
+                            elif isinstance(block, str):
+                                system_texts.append(block)
+                else:
+                    remaining.append(item)
+            if system_texts:
+                payload["instructions"] = "\n\n".join(system_texts)
+                payload["input"] = remaining
+        return payload
+
+
+def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
+    """Instantiate a ``ChatCodex`` wired to the Codex endpoint with OAuth tokens.
 
     Loads (and refreshes if needed) stored OAuth tokens, then constructs a
-    ``ChatOpenAI`` instance whose ``base_url`` points to the Codex backend so
+    ``ChatCodex`` instance whose ``base_url`` points to the Codex backend so
     that all requests are routed to
     ``https://chatgpt.com/backend-api/codex/responses``.
 
-    The model is returned as a plain ``ChatOpenAI``; callers do not need to
-    import this module's internal types.
-
     Args:
-        **kwargs: Extra keyword arguments forwarded to ``ChatOpenAI``
+        **kwargs: Extra keyword arguments forwarded to ``ChatCodex``
             (e.g. ``temperature``, ``max_tokens``, ``streaming``).  ``model``,
             ``api_key``, ``base_url``, and ``default_headers`` are set
             internally and should not be passed.
 
     Returns:
-        A ``ChatOpenAI`` instance ready to make Codex API calls.
+        A ``ChatCodex`` instance ready to make Codex API calls.
 
     Raises:
         ValueError: If no stored tokens are found (user has not logged in).
@@ -43,7 +97,6 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatOpenAI
         load_tokens,
         refresh_if_needed,
     )
-    from langchain_openai import ChatOpenAI
 
     tokens = load_tokens()
     if tokens is None:
@@ -69,10 +122,12 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatOpenAI
     if account_id:
         default_headers["ChatGPT-Account-Id"] = account_id
 
-    return ChatOpenAI(
+    return ChatCodex(
         model=model_name,
         api_key=tokens["access_token"],  # type: ignore[arg-type]
         base_url=CODEX_API_BASE,
         default_headers=default_headers,
+        store=False,
+        streaming=True,
         **kwargs,
     )
