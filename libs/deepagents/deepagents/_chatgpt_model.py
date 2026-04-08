@@ -47,11 +47,19 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatOpenAI
 
     tokens = load_tokens()
     if tokens is None:
-        msg = (
-            "Not logged in to ChatGPT. "
-            "Run: deep-agents login openai"
-        )
-        raise ValueError(msg)
+        import sys
+
+        from deepagents._chatgpt_auth import login_browser, login_device
+
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            print("Not logged in to ChatGPT. Starting login flow...")
+            try:
+                tokens = login_browser()
+            except Exception:
+                tokens = login_device()
+        else:
+            msg = "Not logged in to ChatGPT. Run: deep-agents login openai"
+            raise ValueError(msg)
 
     tokens = refresh_if_needed(tokens)
 
