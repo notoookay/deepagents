@@ -10,6 +10,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from collections.abc import AsyncIterator
+
+from langchain_core.language_models.chat_models import AsyncCallbackManagerForLLMRun
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger(__name__)
@@ -17,17 +22,35 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MODEL = "gpt-5.3-codex"
 
 
+def _flatten_content(content: Any) -> str:
+    """Collapse a Responses API content-block list into a plain string.
+
+    The Codex Responses API returns content as a list of typed blocks, e.g.
+    ``[{"type": "text", "text": "Hello", ...}]``.  This helper extracts and
+    joins all text parts so callers receive a normal string.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in ("text", "output_text"):
+                parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
 class ChatCodex(ChatOpenAI):
-    """``ChatOpenAI`` subclass that fixes system-message handling for the Codex API.
+    """``ChatOpenAI`` subclass tailored for the ChatGPT Codex Responses API.
 
-    The ChatGPT Codex Responses API requires system prompts to be sent with
-    ``role: "developer"`` in the ``input`` array (like other reasoning models).
-    Upstream ``ChatOpenAI`` only performs this ``system`` → ``developer``
-    conversion for ``o``-series models and only on the Chat Completions path.
+    Differences from vanilla ``ChatOpenAI``:
 
-    This subclass overrides ``_get_request_payload`` to convert any
-    ``system``-role items in the Responses API ``input`` to ``developer``,
-    matching what openclaw does for reasoning models.
+    * Moves system/developer messages out of ``input`` into the required
+      ``instructions`` top-level field.
+    * Normalises the response so ``AIMessage.content`` is always a plain
+      string instead of a list of Responses API content blocks.
     """
 
     def _get_request_payload(
@@ -70,6 +93,36 @@ class ChatCodex(ChatOpenAI):
                 payload["instructions"] = "\n\n".join(system_texts)
                 payload["input"] = remaining
         return payload
+
+    async def _agenerate(
+        self,
+        messages: list,
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        result = await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        return _normalize_result(result)
+
+    async def _astream(
+        self,
+        messages: list,
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        async for chunk in super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
+            if isinstance(chunk.message, AIMessageChunk):
+                chunk.message.content = _flatten_content(chunk.message.content)
+            yield chunk
+
+
+def _normalize_result(result: ChatResult) -> ChatResult:
+    """Flatten Responses API content-block lists to plain strings."""
+    for gen in result.generations:
+        if isinstance(gen, ChatGeneration) and isinstance(gen.message, AIMessage):
+            gen.message.content = _flatten_content(gen.message.content)
+    return result
 
 
 def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
