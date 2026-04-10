@@ -1112,6 +1112,13 @@ class Settings:
         return changes
 
     @property
+    def has_chatgpt(self) -> bool:
+        """Check if ChatGPT subscription OAuth tokens are stored."""
+        from deepagents._chatgpt_auth import load_tokens  # noqa: PLC2701
+
+        return load_tokens() is not None
+
+    @property
     def has_openai(self) -> bool:
         """Check if OpenAI API key is configured."""
         return self.openai_api_key is not None
@@ -1786,6 +1793,9 @@ def detect_provider(model_name: str) -> str | None:
     """
     model_lower = model_name.lower()
 
+    if model_lower.startswith("chatgpt:"):
+        return "chatgpt"
+
     if model_lower.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
         return "openai"
 
@@ -1832,6 +1842,10 @@ def _get_default_model_spec() -> str:
         return config.recent_model
 
     s = _get_settings()
+    if s.has_chatgpt:
+        from deepagents._chatgpt_model import DEFAULT_CHATGPT_MODEL  # noqa: PLC2701
+
+        return f"chatgpt:{DEFAULT_CHATGPT_MODEL}"
     if s.has_openai:
         return "openai:gpt-5.2"
     if s.has_anthropic:
@@ -2231,6 +2245,31 @@ def create_model(
         # Bare model name — auto-detect provider or let init_chat_model infer
         model_name = model_spec
         provider = detect_provider(model_spec) or ""
+
+    # ChatGPT subscription — bypass init_chat_model entirely
+    if provider == "chatgpt":
+        from deepagents._chatgpt_model import _build_chatcodex  # noqa: PLC2701
+
+        chatgpt_kwargs: dict[str, Any] = {}
+        if extra_kwargs:
+            chatgpt_kwargs.update(extra_kwargs)
+        model = _build_chatcodex(model=model_name, **chatgpt_kwargs)
+        resolved_provider = "chatgpt"
+
+        if profile_overrides:
+            _apply_profile_overrides(
+                model,
+                profile_overrides,
+                model_name,
+                label="CLI --profile-override",
+                raise_on_failure=True,
+            )
+
+        return ModelResult(
+            model=model,
+            model_name=model_name,
+            provider=resolved_provider,
+        )
 
     # Early credential check — fail fast with an actionable message instead of
     # letting the provider SDK raise an opaque auth error on first invocation.

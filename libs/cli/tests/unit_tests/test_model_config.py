@@ -2566,6 +2566,9 @@ recent = "openai:gpt-5.2"
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch.object(settings, "openai_api_key", None),
             patch.object(settings, "anthropic_api_key", "test-key"),
+            # `has_chatgpt` reads OAuth tokens from disk; isolate the test
+            # from the developer's real login state.
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
             patch.dict(
                 "os.environ",
                 {"ANTHROPIC_API_KEY": "test-key"},
