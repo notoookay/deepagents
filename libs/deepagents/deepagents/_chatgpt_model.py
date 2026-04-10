@@ -10,9 +10,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 
-from langchain_core.language_models.chat_models import AsyncCallbackManagerForLLMRun
+from langchain_core.language_models.chat_models import (
+    AsyncCallbackManagerForLLMRun,
+    CallbackManagerForLLMRun,
+)
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
@@ -127,6 +130,28 @@ class ChatCodex(ChatOpenAI):
                 payload["instructions"] = "\n\n".join(system_texts)
                 payload["input"] = remaining
         return payload
+
+    def _generate(
+        self,
+        messages: list,
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+        return _normalize_result(result)
+
+    def _stream(
+        self,
+        messages: list,
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        for chunk in super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs):
+            if isinstance(chunk.message, AIMessageChunk):
+                chunk.message.content = _flatten_content(chunk.message.content)
+            yield chunk
 
     async def _agenerate(
         self,
