@@ -10,13 +10,17 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import secrets
+import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -26,19 +30,6 @@ CODEX_API_BASE = "https://chatgpt.com/backend-api/codex"
 OAUTH_PORT = 1455
 
 _TOKEN_FILE = Path.home() / ".deepagents" / "chatgpt_tokens.json"
-
-ALLOWED_CODEX_MODELS = frozenset(
-    [
-        "gpt-5.1-codex",
-        "gpt-5.1-codex-max",
-        "gpt-5.1-codex-mini",
-        "gpt-5.2",
-        "gpt-5.2-codex",
-        "gpt-5.3-codex",
-        "gpt-5.4",
-        "gpt-5.4-mini",
-    ]
-)
 
 
 class TokenData(TypedDict):
@@ -78,7 +69,7 @@ def _parse_jwt_payload(token: str) -> dict | None:
     try:
         padded = parts[1] + "=" * (-len(parts[1]) % 4)
         return json.loads(base64.urlsafe_b64decode(padded))
-    except Exception:
+    except (ValueError, json.JSONDecodeError):
         return None
 
 
@@ -107,24 +98,30 @@ def _account_id_from_tokens(access_token: str, id_token: str | None) -> str | No
 
 
 def _post_form(url: str, data: dict[str, str]) -> dict:
+    if not url.startswith("https://"):
+        msg = f"Refusing non-HTTPS URL: {url}"
+        raise ValueError(msg)
     body = urllib.parse.urlencode(data).encode()
-    req = urllib.request.Request(
+    req = urllib.request.Request(  # noqa: S310
         url,
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req) as resp:  # noqa: S310
         return json.loads(resp.read())
 
 
 def _post_json(url: str, data: dict, extra_headers: dict[str, str] | None = None) -> dict:
+    if not url.startswith("https://"):
+        msg = f"Refusing non-HTTPS URL: {url}"
+        raise ValueError(msg)
     body = json.dumps(data).encode()
     headers = {"Content-Type": "application/json"}
     if extra_headers:
         headers.update(extra_headers)
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req) as resp:
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")  # noqa: S310
+    with urllib.request.urlopen(req) as resp:  # noqa: S310
         return json.loads(resp.read())
 
 
@@ -187,7 +184,7 @@ def load_tokens() -> TokenData | None:
             expires_at=float(data["expires_at"]),
             account_id=data.get("account_id"),
         )
-    except Exception as exc:
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
         logger.debug("Could not load ChatGPT tokens: %s", exc)
         return None
 
@@ -221,6 +218,64 @@ def refresh_if_needed(tokens: TokenData) -> TokenData:
 # ---------------------------------------------------------------------------
 
 
+_SUCCESS_HTML = b"""<!doctype html><html><head><title>Deep Agents - Login Successful</title>
+<style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
+align-items:center;height:100vh;margin:0;background:#131010;color:#f1ecec;}
+.container{text-align:center;padding:2rem;}h1{margin-bottom:1rem;}</style></head>
+<body><div class="container"><h1>Login Successful</h1>
+<p>You can close this window and return to Deep Agents.</p></div>
+<script>setTimeout(()=>window.close(),2000)</script></body></html>"""
+
+_OAUTH_TIMEOUT_SECONDS = 300
+
+
+def _make_callback_handler(
+    expected_state: str,
+    result: dict,
+    error_holder: list[str],
+    done: threading.Event,
+) -> type[BaseHTTPRequestHandler]:
+    """Build an ``HTTPServer`` handler class bound to a single OAuth callback."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: Any, **kwargs: Any) -> None:
+            """Silence stdout access logs."""
+
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            if parsed.path != "/auth/callback":
+                self._respond(404, b"Not found")
+                return
+
+            code = (qs.get("code") or [None])[0]
+            returned_state = (qs.get("state") or [None])[0]
+            err = (qs.get("error") or [None])[0]
+
+            if err:
+                error_holder.append(qs.get("error_description", [err])[0])
+                self._respond(400, b"Authorization failed")
+            elif not code:
+                error_holder.append("Missing authorization code")
+                self._respond(400, b"Missing code")
+            elif returned_state != expected_state:
+                error_holder.append("State mismatch (possible CSRF)")
+                self._respond(400, b"State mismatch")
+            else:
+                result["code"] = code
+                self._respond(200, _SUCCESS_HTML, content_type="text/html")
+            done.set()
+
+        def _respond(self, status: int, body: bytes, content_type: str = "text/plain") -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.end_headers()
+            self.wfile.write(body)
+
+    return _Handler
+
+
 def login_browser() -> TokenData:
     """Interactive browser PKCE flow.
 
@@ -231,9 +286,6 @@ def login_browser() -> TokenData:
     Raises:
         RuntimeError: If authorization fails or times out.
     """
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
     verifier = _generate_verifier()
     challenge = _derive_challenge(verifier)
     state = _generate_state()
@@ -259,71 +311,30 @@ def login_browser() -> TokenData:
     error_holder: list[str] = []
     done = threading.Event()
 
-    success_html = b"""<!doctype html><html><head><title>Deep Agents - Login Successful</title>
-<style>body{font-family:system-ui,sans-serif;display:flex;justify-content:center;
-align-items:center;height:100vh;margin:0;background:#131010;color:#f1ecec;}
-.container{text-align:center;padding:2rem;}h1{margin-bottom:1rem;}</style></head>
-<body><div class="container"><h1>Login Successful</h1>
-<p>You can close this window and return to Deep Agents.</p></div>
-<script>setTimeout(()=>window.close(),2000)</script></body></html>"""
-
-    class _Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):  # suppress access logs
-            pass
-
-        def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            qs = urllib.parse.parse_qs(parsed.query)
-
-            if parsed.path == "/auth/callback":
-                code = (qs.get("code") or [None])[0]
-                returned_state = (qs.get("state") or [None])[0]
-                err = (qs.get("error") or [None])[0]
-
-                if err:
-                    error_holder.append(qs.get("error_description", [err])[0])
-                    self._respond(400, b"Authorization failed")
-                elif not code:
-                    error_holder.append("Missing authorization code")
-                    self._respond(400, b"Missing code")
-                elif returned_state != state:
-                    error_holder.append("State mismatch (possible CSRF)")
-                    self._respond(400, b"State mismatch")
-                else:
-                    result["code"] = code
-                    self._respond(200, success_html, content_type="text/html")
-                done.set()
-            else:
-                self._respond(404, b"Not found")
-
-        def _respond(self, status: int, body: bytes, content_type: str = "text/plain"):
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.end_headers()
-            self.wfile.write(body)
-
-    server = HTTPServer(("127.0.0.1", OAUTH_PORT), _Handler)
+    handler_cls = _make_callback_handler(state, result, error_holder, done)
+    server = HTTPServer(("127.0.0.1", OAUTH_PORT), handler_cls)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
     try:
-        import webbrowser
-
-        print(f"Opening browser for ChatGPT authorization...")
-        print(f"If the browser did not open, visit:\n  {auth_url}\n")
+        logger.info("Opening browser for ChatGPT authorization...")
+        logger.info("If the browser did not open, visit: %s", auth_url)
         webbrowser.open(auth_url)
 
-        if not done.wait(timeout=300):
-            raise RuntimeError("OAuth callback timed out after 5 minutes")
+        if not done.wait(timeout=_OAUTH_TIMEOUT_SECONDS):
+            msg = "OAuth callback timed out after 5 minutes"
+            raise RuntimeError(msg)
     finally:
         server.shutdown()
 
     if error_holder:
-        raise RuntimeError(f"Authorization failed: {error_holder[0]}")
+        msg = f"Authorization failed: {error_holder[0]}"
+        raise RuntimeError(msg)
 
     code = result.get("code")
     if not code:
-        raise RuntimeError("No authorization code received")
+        msg = "No authorization code received"
+        raise RuntimeError(msg)
 
     resp = _exchange_code(code, redirect_uri, verifier)
     tokens = _parse_token_response(resp)
@@ -336,6 +347,10 @@ align-items:center;height:100vh;margin:0;background:#131010;color:#f1ecec;}
 # ---------------------------------------------------------------------------
 
 
+_DEVICE_POLL_SAFETY_MARGIN_SECONDS = 3
+_DEVICE_POLL_PENDING_STATUS = (403, 404)
+
+
 def login_device() -> TokenData:
     """Headless device-code flow.
 
@@ -345,8 +360,6 @@ def login_device() -> TokenData:
     Raises:
         RuntimeError: If device authorization fails.
     """
-    import time as _time
-
     ua = f"deepagents-cli/{_deepagents_version()}"
     device_resp = _post_json(
         f"{ISSUER}/api/accounts/deviceauth/usercode",
@@ -357,10 +370,10 @@ def login_device() -> TokenData:
     user_code = device_resp["user_code"]
     interval_s = max(int(device_resp.get("interval", 5)), 1)
 
-    print(f"Open {ISSUER}/codex/device in your browser and enter code: {user_code}\n")
+    logger.info("Open %s/codex/device in your browser and enter code: %s", ISSUER, user_code)
 
     while True:
-        _time.sleep(interval_s + 3)  # +3s safety margin
+        time.sleep(interval_s + _DEVICE_POLL_SAFETY_MARGIN_SECONDS)
         try:
             poll_resp = _post_json(
                 f"{ISSUER}/api/accounts/deviceauth/token",
@@ -368,9 +381,10 @@ def login_device() -> TokenData:
                 extra_headers={"User-Agent": ua},
             )
         except urllib.error.HTTPError as exc:
-            if exc.code in (403, 404):
+            if exc.code in _DEVICE_POLL_PENDING_STATUS:
                 continue  # still pending
-            raise RuntimeError(f"Device auth polling failed: {exc}") from exc
+            msg = f"Device auth polling failed: {exc}"
+            raise RuntimeError(msg) from exc
 
         # Exchange the authorization_code returned by device auth
         token_resp = _post_form(
@@ -395,8 +409,6 @@ def login_device() -> TokenData:
 
 def _deepagents_version() -> str:
     try:
-        from importlib.metadata import version
-
         return version("deepagents-cli")
-    except Exception:
+    except PackageNotFoundError:
         return "0.0.0"

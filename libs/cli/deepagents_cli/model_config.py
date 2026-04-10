@@ -553,7 +553,7 @@ def get_available_models() -> dict[str, list[str]]:
     # the hand-maintained model list directly so the /model picker sees them.
     if "chatgpt" not in available and config.is_provider_enabled("chatgpt"):
         try:
-            from deepagents._chatgpt_model import CHATGPT_MODELS
+            from deepagents._chatgpt_model import CHATGPT_MODELS  # noqa: PLC2701
         except ImportError:
             logger.debug("deepagents._chatgpt_model not importable; skipping chatgpt")
         else:
@@ -763,7 +763,7 @@ def has_provider_credentials(provider: str) -> bool | None:
     # "logged in" from "not logged in" instead of showing "unknown".
     if provider == "chatgpt":
         try:
-            from deepagents._chatgpt_auth import load_tokens
+            from deepagents._chatgpt_auth import load_tokens  # noqa: PLC2701
         except ImportError:
             return None
         return load_tokens() is not None

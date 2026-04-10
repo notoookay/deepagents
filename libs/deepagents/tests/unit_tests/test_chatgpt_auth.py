@@ -1,22 +1,26 @@
 """Unit tests for ChatGPT OAuth authentication helpers."""
+# ruff: noqa: S105, S106
 
 from __future__ import annotations
 
 import base64
 import json
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from deepagents._chatgpt_auth import (
     TokenData,
     _account_id_from_tokens,
     _derive_challenge,
     _extract_account_id,
-    _generate_verifier,
     _generate_state,
+    _generate_verifier,
     _parse_jwt_payload,
     _parse_token_response,
     delete_tokens,
@@ -24,7 +28,6 @@ from deepagents._chatgpt_auth import (
     refresh_if_needed,
     save_tokens,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,9 +104,7 @@ class TestExtractAccountId:
         assert _extract_account_id(claims) == "org-direct"
 
     def test_nested_auth_claim(self) -> None:
-        claims = {
-            "https://api.openai.com/auth": {"chatgpt_account_id": "org-nested"}
-        }
+        claims = {"https://api.openai.com/auth": {"chatgpt_account_id": "org-nested"}}
         assert _extract_account_id(claims) == "org-nested"
 
     def test_organizations_fallback(self) -> None:

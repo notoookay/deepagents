@@ -2,8 +2,9 @@
 
 Usage:
     uv run python tests/test_chatgpt_terminal.py
-    uv run python tests/test_chatgpt_terminal.py --model gpt-5.1-codex
+    uv run python tests/test_chatgpt_terminal.py --model gpt-5.3-codex
 """
+# ruff: noqa: T201, ASYNC250, BLE001
 
 import argparse
 import asyncio

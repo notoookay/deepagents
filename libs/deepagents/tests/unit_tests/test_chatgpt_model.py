@@ -18,19 +18,24 @@ from deepagents._chatgpt_model import (
 )
 
 
-def _make_tokens(**overrides) -> TokenData:
+def _make_tokens(**overrides: object) -> TokenData:
     base = TokenData(
-        access_token="test-access-token",
-        refresh_token="test-refresh-token",
+        access_token="test-access-token",  # noqa: S106
+        refresh_token="test-refresh-token",  # noqa: S106
         expires_at=time.time() + 3600,
         account_id="org-test",
     )
-    base.update(overrides)
+    base.update(overrides)  # type: ignore[typeddict-item]
     return base
 
 
-# Patch target for the ChatCodex constructor (imported inside _build_chatcodex)
+# Patch targets — functions are imported into _chatgpt_model at module load,
+# so patches must target the name in that namespace.
 _CHAT_CODEX = "deepagents._chatgpt_model.ChatCodex"
+_LOAD_TOKENS = "deepagents._chatgpt_model.load_tokens"
+_REFRESH = "deepagents._chatgpt_model.refresh_if_needed"
+_LOGIN_BROWSER = "deepagents._chatgpt_model.login_browser"
+_LOGIN_DEVICE = "deepagents._chatgpt_model.login_device"
 
 
 # ---------------------------------------------------------------------------
@@ -43,86 +48,86 @@ class TestBuildChatCodexWithTokens:
         tokens = _make_tokens()
         fake_instance = MagicMock()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX, return_value=fake_instance) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX, return_value=fake_instance) as mock_chat_codex,
         ):
             result = _build_chatcodex()
 
         assert result is fake_instance
-        MockChatCodex.assert_called_once()
+        mock_chat_codex.assert_called_once()
 
     def test_passes_account_id_header(self) -> None:
         tokens = _make_tokens(account_id="org-abc")
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
         ):
             _build_chatcodex()
 
-        _, kwargs = MockChatCodex.call_args
+        _, kwargs = mock_chat_codex.call_args
         assert kwargs["default_headers"]["ChatGPT-Account-Id"] == "org-abc"
 
     def test_no_account_id_header_when_absent(self) -> None:
         tokens = _make_tokens(account_id=None)
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
         ):
             _build_chatcodex()
 
-        _, kwargs = MockChatCodex.call_args
+        _, kwargs = mock_chat_codex.call_args
         assert "ChatGPT-Account-Id" not in kwargs["default_headers"]
 
     def test_custom_model_kwarg_forwarded(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
         ):
             _build_chatcodex(model="gpt-5.4-mini")
 
-        _, kwargs = MockChatCodex.call_args
+        _, kwargs = mock_chat_codex.call_args
         assert kwargs["model"] == "gpt-5.4-mini"
 
     def test_default_model_used_when_omitted(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
         ):
             _build_chatcodex()
 
-        _, kwargs = MockChatCodex.call_args
+        _, kwargs = mock_chat_codex.call_args
         assert kwargs["model"] == DEFAULT_CHATGPT_MODEL
 
     def test_extra_kwargs_forwarded(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
         ):
             _build_chatcodex(temperature=0.5, max_tokens=256)
 
-        _, kwargs = MockChatCodex.call_args
+        _, kwargs = mock_chat_codex.call_args
         assert kwargs["temperature"] == 0.5
         assert kwargs["max_tokens"] == 256
 
     def test_originator_header_always_set(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
         ):
             _build_chatcodex()
 
-        _, kwargs = MockChatCodex.call_args
+        _, kwargs = mock_chat_codex.call_args
         assert kwargs["default_headers"]["originator"] == "deepagents"
 
 
@@ -134,22 +139,22 @@ class TestBuildChatCodexWithTokens:
 class TestBuildChatCodexNotLoggedIn:
     def test_raises_when_not_tty(self) -> None:
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
+            patch(_LOAD_TOKENS, return_value=None),
             patch("sys.stdin.isatty", return_value=False),
             patch("sys.stdout.isatty", return_value=False),
+            pytest.raises(ValueError, match="Not logged in"),
         ):
-            with pytest.raises(ValueError, match="Not logged in"):
-                _build_chatcodex()
+            _build_chatcodex()
 
     def test_raises_when_only_stdin_is_tty(self) -> None:
         """Both stdin AND stdout must be TTYs to attempt login."""
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
+            patch(_LOAD_TOKENS, return_value=None),
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=False),
+            pytest.raises(ValueError, match="Not logged in"),
         ):
-            with pytest.raises(ValueError, match="Not logged in"):
-                _build_chatcodex()
+            _build_chatcodex()
 
 
 # ---------------------------------------------------------------------------
@@ -161,12 +166,12 @@ class TestBuildChatCodexAutoLogin:
     def test_browser_login_triggered_on_tty(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_LOAD_TOKENS, return_value=None),
+            patch(_REFRESH, return_value=tokens),
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
-            patch("deepagents._chatgpt_auth.login_browser", return_value=tokens) as mock_browser,
-            patch("deepagents._chatgpt_auth.login_device") as mock_device,
+            patch(_LOGIN_BROWSER, return_value=tokens) as mock_browser,
+            patch(_LOGIN_DEVICE) as mock_device,
             patch(_CHAT_CODEX),
         ):
             _build_chatcodex()
@@ -177,12 +182,12 @@ class TestBuildChatCodexAutoLogin:
     def test_device_login_fallback_when_browser_fails(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_LOAD_TOKENS, return_value=None),
+            patch(_REFRESH, return_value=tokens),
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
-            patch("deepagents._chatgpt_auth.login_browser", side_effect=RuntimeError("no browser")),
-            patch("deepagents._chatgpt_auth.login_device", return_value=tokens) as mock_device,
+            patch(_LOGIN_BROWSER, side_effect=RuntimeError("no browser")),
+            patch(_LOGIN_DEVICE, return_value=tokens) as mock_device,
             patch(_CHAT_CODEX),
         ):
             _build_chatcodex()
@@ -193,11 +198,11 @@ class TestBuildChatCodexAutoLogin:
         tokens = _make_tokens()
         fake_instance = MagicMock()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_LOAD_TOKENS, return_value=None),
+            patch(_REFRESH, return_value=tokens),
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout.isatty", return_value=True),
-            patch("deepagents._chatgpt_auth.login_browser", return_value=tokens),
+            patch(_LOGIN_BROWSER, return_value=tokens),
             patch(_CHAT_CODEX, return_value=fake_instance),
         ):
             result = _build_chatcodex()
@@ -239,10 +244,7 @@ class TestChatCodexInstructions:
             HumanMessage(content="Hello"),
         ]
         payload = model._get_request_payload(messages)
-        user_items = [
-            item for item in payload["input"]
-            if isinstance(item, dict) and item.get("role") == "user"
-        ]
+        user_items = [item for item in payload["input"] if isinstance(item, dict) and item.get("role") == "user"]
         assert len(user_items) == 1
 
     def test_no_system_message_still_works(self) -> None:
@@ -289,9 +291,7 @@ class TestChatGPTModelList:
             "gpt-5-mini",
             "gpt-4o",
         ):
-            assert _is_deprecated_chatgpt_model(deprecated), (
-                f"{deprecated} should be flagged as deprecated"
-            )
+            assert _is_deprecated_chatgpt_model(deprecated), f"{deprecated} should be flagged as deprecated"
 
     def test_supported_models_not_deprecated(self) -> None:
         for model in CHATGPT_MODELS:
@@ -310,22 +310,22 @@ class TestBuildChatCodexDeprecationGate:
     def test_raises_on_deprecated_model(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
             patch(_CHAT_CODEX),
+            pytest.raises(ValueError, match="deprecated"),
         ):
-            with pytest.raises(ValueError, match="deprecated"):
-                _build_chatcodex(model="gpt-5.2-codex")
+            _build_chatcodex(model="gpt-5.2-codex")
 
     def test_deprecated_model_error_lists_alternatives(self) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
             patch(_CHAT_CODEX),
+            pytest.raises(ValueError, match="deprecated") as excinfo,
         ):
-            with pytest.raises(ValueError) as excinfo:
-                _build_chatcodex(model="gpt-5.1-codex")
+            _build_chatcodex(model="gpt-5.1-codex")
         # Error message should surface the supported alternatives.
         for model in CHATGPT_MODELS:
             assert model in str(excinfo.value)
@@ -333,12 +333,12 @@ class TestBuildChatCodexDeprecationGate:
     def test_unknown_model_warns_but_proceeds(self, caplog) -> None:
         tokens = _make_tokens()
         with (
-            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
-            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
-            patch(_CHAT_CODEX) as MockChatCodex,
+            patch(_LOAD_TOKENS, return_value=tokens),
+            patch(_REFRESH, return_value=tokens),
+            patch(_CHAT_CODEX) as mock_chat_codex,
             caplog.at_level("WARNING", logger="deepagents._chatgpt_model"),
         ):
             _build_chatcodex(model="gpt-6-codex")
 
-        MockChatCodex.assert_called_once()
+        mock_chat_codex.assert_called_once()
         assert any("forward-compat" in rec.message for rec in caplog.records)

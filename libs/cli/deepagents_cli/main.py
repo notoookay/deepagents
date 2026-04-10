@@ -474,7 +474,7 @@ def parse_args() -> argparse.Namespace:
     login_openai.add_argument(
         "--headless",
         action="store_true",
-        help="Use device-code flow instead of browser redirect (for headless environments)",
+        help="Use device-code flow instead of browser redirect (for headless env)",
     )
 
     logout_parser = subparsers.add_parser(
@@ -1746,7 +1746,7 @@ def cli_main() -> None:
         sys.exit(0)
 
 
-def _execute_login(args) -> None:
+def _execute_login(args: argparse.Namespace) -> None:
     """Handle ``deep-agents login <provider>`` commands."""
     provider = getattr(args, "login_provider", None)
     if provider != "openai":
@@ -1759,14 +1759,11 @@ def _execute_login(args) -> None:
         sys.exit(1)
 
     headless = getattr(args, "headless", False)
-    from deepagents._chatgpt_auth import login_browser, login_device
+    from deepagents._chatgpt_auth import login_browser, login_device  # noqa: PLC2701
 
     try:
-        if headless:
-            tokens = login_device()
-        else:
-            tokens = login_browser()
-    except Exception as exc:
+        tokens = login_device() if headless else login_browser()
+    except (RuntimeError, OSError, ValueError) as exc:
         from rich.console import Console as _Console
         from rich.markup import escape
 
@@ -1776,7 +1773,10 @@ def _execute_login(args) -> None:
         sys.exit(1)
 
     account_id = tokens.get("account_id") or "(unknown)"
-    from deepagents._chatgpt_model import CHATGPT_MODELS, DEFAULT_CHATGPT_MODEL
+    from deepagents._chatgpt_model import (
+        CHATGPT_MODELS,  # noqa: PLC2701
+        DEFAULT_CHATGPT_MODEL,  # noqa: PLC2701
+    )
 
     try:
         from rich.console import Console as _Console
@@ -1788,11 +1788,11 @@ def _execute_login(args) -> None:
             f"or pick one of: "
             f"{', '.join(f'[cyan]chatgpt:{m}[/cyan]' for m in CHATGPT_MODELS)}."
         )
-    except Exception:
-        print(f"Logged in to ChatGPT. Account: {account_id}")
+    except ImportError:
+        sys.stdout.write(f"Logged in to ChatGPT. Account: {account_id}\n")
 
 
-def _execute_logout(args) -> None:
+def _execute_logout(args: argparse.Namespace) -> None:
     """Handle ``deep-agents logout <provider>`` commands."""
     provider = getattr(args, "logout_provider", None)
     if provider != "openai":
@@ -1804,15 +1804,15 @@ def _execute_logout(args) -> None:
         )
         sys.exit(1)
 
-    from deepagents._chatgpt_auth import delete_tokens
+    from deepagents._chatgpt_auth import delete_tokens  # noqa: PLC2701
 
     delete_tokens()
     try:
         from rich.console import Console as _Console
 
         _Console().print("[bold green]Logged out from ChatGPT.[/bold green]")
-    except Exception:
-        print("Logged out from ChatGPT.")
+    except ImportError:
+        sys.stdout.write("Logged out from ChatGPT.\n")
 
 
 if __name__ == "__main__":

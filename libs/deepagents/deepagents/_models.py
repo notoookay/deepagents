@@ -92,9 +92,12 @@ def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
     if isinstance(model, BaseChatModel):
         return model
     if model.startswith("chatgpt:"):
-        from deepagents._chatgpt_model import _build_chatcodex
+        # Deferred import: keeps chatgpt OAuth/ChatOpenAI wiring out of the
+        # hot path for non-chatgpt models, and preserves the patch target
+        # ``deepagents._chatgpt_model._build_chatcodex`` used in tests.
+        from deepagents._chatgpt_model import _build_chatcodex  # noqa: PLC0415
 
-        model_name = model[len("chatgpt:"):]
+        model_name = model[len("chatgpt:") :]
         return _build_chatcodex(model=model_name) if model_name else _build_chatcodex()
     if model.startswith("openai:"):
         return init_chat_model(model, use_responses_api=True)

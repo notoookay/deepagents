@@ -8,17 +8,28 @@ with the required ``Authorization`` and ``ChatGPT-Account-Id`` headers.
 from __future__ import annotations
 
 import logging
-from typing import Any
+import sys
+from typing import TYPE_CHECKING, Any
 
-from collections.abc import AsyncIterator, Iterator
-
-from langchain_core.language_models.chat_models import (
-    AsyncCallbackManagerForLLMRun,
-    CallbackManagerForLLMRun,
-)
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_openai import ChatOpenAI
+
+from deepagents._chatgpt_auth import (
+    CODEX_API_BASE,
+    load_tokens,
+    login_browser,
+    login_device,
+    refresh_if_needed,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Iterator
+
+    from langchain_core.language_models.chat_models import (
+        AsyncCallbackManagerForLLMRun,
+        CallbackManagerForLLMRun,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +64,10 @@ def _is_deprecated_chatgpt_model(model: str) -> bool:
         return False
     # Forward-compat: accept unknown gpt-5.3+/gpt-6+ that we haven't cataloged.
     lower = model.lower()
-    for prefix in ("gpt-5.0", "gpt-5.1", "gpt-5.2", "gpt-5-", "gpt-4"):
-        if lower.startswith(prefix) or lower == prefix.rstrip("-"):
-            return True
-    return False
+    return any(lower.startswith(prefix) or lower == prefix.rstrip("-") for prefix in ("gpt-5.0", "gpt-5.1", "gpt-5.2", "gpt-5-", "gpt-4"))
 
 
-def _flatten_content(content: Any) -> str:
+def _flatten_content(content: Any) -> str:  # noqa: ANN401
     """Collapse a Responses API content-block list into a plain string.
 
     The Codex Responses API returns content as a list of typed blocks, e.g.
@@ -92,7 +100,7 @@ class ChatCodex(ChatOpenAI):
 
     def _get_request_payload(
         self,
-        input_: Any,
+        input_: Any,  # noqa: ANN401
         *,
         stop: list[str] | None = None,
         **kwargs: Any,
@@ -119,9 +127,7 @@ class ChatCodex(ChatOpenAI):
                                 "text",
                                 "input_text",
                             ):
-                                system_texts.append(
-                                    block.get("text", "")
-                                )
+                                system_texts.append(block.get("text", ""))
                             elif isinstance(block, str):
                                 system_texts.append(block)
                 else:
@@ -184,7 +190,7 @@ def _normalize_result(result: ChatResult) -> ChatResult:
     return result
 
 
-def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
+def _build_chatcodex(**kwargs: Any) -> ChatCodex:
     """Instantiate a ``ChatCodex`` wired to the Codex endpoint with OAuth tokens.
 
     Loads (and refreshes if needed) stored OAuth tokens, then constructs a
@@ -208,37 +214,24 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
     model_name: str = kwargs.pop("model", _DEFAULT_MODEL)
     if _is_deprecated_chatgpt_model(model_name):
         supported = ", ".join(CHATGPT_MODELS)
-        msg = (
-            f"ChatGPT model {model_name!r} is deprecated and no longer served "
-            f"on the Codex Responses API. Use one of: {supported}."
-        )
+        msg = f"ChatGPT model {model_name!r} is deprecated and no longer served on the Codex Responses API. Use one of: {supported}."
         raise ValueError(msg)
     if model_name not in CHATGPT_MODELS:
         # Unknown but not explicitly deprecated — likely forward-compat.
         logger.warning(
-            "ChatGPT model %r is not in the known model list %s; "
-            "proceeding as forward-compat.",
+            "ChatGPT model %r is not in the known model list %s; proceeding as forward-compat.",
             model_name,
             CHATGPT_MODELS,
         )
 
-    from deepagents._chatgpt_auth import (
-        CODEX_API_BASE,
-        load_tokens,
-        refresh_if_needed,
-    )
-
     tokens = load_tokens()
     if tokens is None:
-        import sys
-
-        from deepagents._chatgpt_auth import login_browser, login_device
-
         if sys.stdin.isatty() and sys.stdout.isatty():
-            print("Not logged in to ChatGPT. Starting login flow...")
+            logger.info("Not logged in to ChatGPT. Starting login flow...")
             try:
                 tokens = login_browser()
-            except Exception:
+            except (RuntimeError, OSError) as exc:
+                logger.info("Browser login failed (%s); falling back to device flow.", exc)
                 tokens = login_device()
         else:
             msg = "Not logged in to ChatGPT. Run: deep-agents login openai"
@@ -251,12 +244,15 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
     if account_id:
         default_headers["ChatGPT-Account-Id"] = account_id
 
-    return ChatCodex(
-        model=model_name,
-        api_key=tokens["access_token"],  # type: ignore[arg-type]
-        base_url=CODEX_API_BASE,
-        default_headers=default_headers,
-        store=False,
-        streaming=True,
+    # ``ChatOpenAI`` uses dynamic Pydantic field kwargs; ``ty`` can't see through
+    # the model definition, so pass the full kwarg bag through a dict.
+    codex_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "api_key": tokens["access_token"],
+        "base_url": CODEX_API_BASE,
+        "default_headers": default_headers,
+        "store": False,
+        "streaming": True,
         **kwargs,
-    )
+    }
+    return ChatCodex(**codex_kwargs)

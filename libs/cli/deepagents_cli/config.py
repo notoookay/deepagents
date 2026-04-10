@@ -1114,7 +1114,7 @@ class Settings:
     @property
     def has_chatgpt(self) -> bool:
         """Check if ChatGPT subscription OAuth tokens are stored."""
-        from deepagents._chatgpt_auth import load_tokens
+        from deepagents._chatgpt_auth import load_tokens  # noqa: PLC2701
 
         return load_tokens() is not None
 
@@ -1843,7 +1843,7 @@ def _get_default_model_spec() -> str:
 
     s = _get_settings()
     if s.has_chatgpt:
-        from deepagents._chatgpt_model import DEFAULT_CHATGPT_MODEL
+        from deepagents._chatgpt_model import DEFAULT_CHATGPT_MODEL  # noqa: PLC2701
 
         return f"chatgpt:{DEFAULT_CHATGPT_MODEL}"
     if s.has_openai:
@@ -2248,7 +2248,7 @@ def create_model(
 
     # ChatGPT subscription — bypass init_chat_model entirely
     if provider == "chatgpt":
-        from deepagents._chatgpt_model import _build_chatcodex
+        from deepagents._chatgpt_model import _build_chatcodex  # noqa: PLC2701
 
         chatgpt_kwargs: dict[str, Any] = {}
         if extra_kwargs:
@@ -2270,7 +2270,7 @@ def create_model(
             model_name=model_name,
             provider=resolved_provider,
         )
-      
+
     # Early credential check — fail fast with an actionable message instead of
     # letting the provider SDK raise an opaque auth error on first invocation.
     # Providers that support implicit auth (e.g., Vertex AI ADC) are excluded
