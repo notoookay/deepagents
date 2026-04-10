@@ -1843,7 +1843,9 @@ def _get_default_model_spec() -> str:
 
     s = _get_settings()
     if s.has_chatgpt:
-        return "chatgpt:gpt-5.1-codex"
+        from deepagents._chatgpt_model import DEFAULT_CHATGPT_MODEL
+
+        return f"chatgpt:{DEFAULT_CHATGPT_MODEL}"
     if s.has_openai:
         return "openai:gpt-5.2"
     if s.has_anthropic:

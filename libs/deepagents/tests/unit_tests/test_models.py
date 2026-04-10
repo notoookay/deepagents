@@ -37,8 +37,8 @@ class TestResolveModel:
     def test_chatgpt_prefix_calls_build_chatcodex(self) -> None:
         fake_model = MagicMock(spec=BaseChatModel)
         with patch("deepagents._chatgpt_model._build_chatcodex", return_value=fake_model) as mock:
-            result = resolve_model("chatgpt:gpt-5.1-codex")
-        mock.assert_called_once_with(model="gpt-5.1-codex")
+            result = resolve_model("chatgpt:gpt-5.3-codex")
+        mock.assert_called_once_with(model="gpt-5.3-codex")
         assert result is fake_model
 
     def test_chatgpt_prefix_bare_uses_default_model(self) -> None:

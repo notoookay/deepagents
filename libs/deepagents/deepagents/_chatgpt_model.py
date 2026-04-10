@@ -19,7 +19,41 @@ from langchain_openai import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "gpt-5.3-codex"
+#: Models supported by the ChatGPT Plus/Pro subscription via the Codex
+#: Responses API.  Sourced from the OpenAI Codex model catalog; keep in sync
+#: with upstream (models prior to ``gpt-5.3`` are deprecated and rejected).
+CHATGPT_MODELS: tuple[str, ...] = (
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-spark",
+)
+
+#: Default model when the user passes a bare ``chatgpt:`` prefix.  Codex-tuned
+#: variant is preferred for coding workloads.
+DEFAULT_CHATGPT_MODEL = "gpt-5.3-codex"
+
+_DEFAULT_MODEL = DEFAULT_CHATGPT_MODEL
+
+
+def _is_deprecated_chatgpt_model(model: str) -> bool:
+    """Return ``True`` if ``model`` is a ChatGPT model OpenAI has deprecated.
+
+    ``gpt-5.2`` and all earlier GPT-5 point releases are no longer served on
+    the Codex Responses endpoint.  Allow any known-good model in
+    :data:`CHATGPT_MODELS`, and allow forward-compat IDs (anything ``gpt-5.3``
+    or newer) that we don't yet list.  Anything else — specifically
+    ``gpt-5.0/5.1/5.2`` family — is rejected.
+    """
+    if model in CHATGPT_MODELS:
+        return False
+    # Forward-compat: accept unknown gpt-5.3+/gpt-6+ that we haven't cataloged.
+    lower = model.lower()
+    for prefix in ("gpt-5.0", "gpt-5.1", "gpt-5.2", "gpt-5-", "gpt-4"):
+        if lower.startswith(prefix) or lower == prefix.rstrip("-"):
+            return True
+    return False
 
 
 def _flatten_content(content: Any) -> str:
@@ -143,8 +177,26 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
         A ``ChatCodex`` instance ready to make Codex API calls.
 
     Raises:
-        ValueError: If no stored tokens are found (user has not logged in).
+        ValueError: If no stored tokens are found (user has not logged in),
+            or if the requested model has been deprecated by OpenAI.
     """
+    model_name: str = kwargs.pop("model", _DEFAULT_MODEL)
+    if _is_deprecated_chatgpt_model(model_name):
+        supported = ", ".join(CHATGPT_MODELS)
+        msg = (
+            f"ChatGPT model {model_name!r} is deprecated and no longer served "
+            f"on the Codex Responses API. Use one of: {supported}."
+        )
+        raise ValueError(msg)
+    if model_name not in CHATGPT_MODELS:
+        # Unknown but not explicitly deprecated — likely forward-compat.
+        logger.warning(
+            "ChatGPT model %r is not in the known model list %s; "
+            "proceeding as forward-compat.",
+            model_name,
+            CHATGPT_MODELS,
+        )
+
     from deepagents._chatgpt_auth import (
         CODEX_API_BASE,
         load_tokens,
@@ -169,7 +221,6 @@ def _build_chatcodex(**kwargs: Any):  # -> ChatCodex
 
     tokens = refresh_if_needed(tokens)
 
-    model_name: str = kwargs.pop("model", _DEFAULT_MODEL)
     default_headers: dict[str, str] = {"originator": "deepagents"}
     account_id = tokens.get("account_id")
     if account_id:

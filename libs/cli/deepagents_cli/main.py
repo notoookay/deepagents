@@ -1748,14 +1748,17 @@ def _execute_login(args) -> None:
         sys.exit(1)
 
     account_id = tokens.get("account_id") or "(unknown)"
+    from deepagents._chatgpt_model import CHATGPT_MODELS, DEFAULT_CHATGPT_MODEL
+
     try:
         from rich.console import Console as _Console
 
         _Console().print(
             f"[bold green]Logged in to ChatGPT.[/bold green] "
             f"Account: {account_id}\n"
-            f"Use [cyan]chatgpt:gpt-5.1-codex[/cyan] (or any "
-            f"[cyan]chatgpt:<model>[/cyan]) as your model."
+            f"Use [cyan]chatgpt:{DEFAULT_CHATGPT_MODEL}[/cyan] as your model, "
+            f"or pick one of: "
+            f"{', '.join(f'[cyan]chatgpt:{m}[/cyan]' for m in CHATGPT_MODELS)}."
         )
     except Exception:
         print(f"Logged in to ChatGPT. Account: {account_id}")

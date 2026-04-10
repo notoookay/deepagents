@@ -9,7 +9,13 @@ import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from deepagents._chatgpt_auth import TokenData
-from deepagents._chatgpt_model import ChatCodex, _build_chatcodex
+from deepagents._chatgpt_model import (
+    CHATGPT_MODELS,
+    DEFAULT_CHATGPT_MODEL,
+    ChatCodex,
+    _build_chatcodex,
+    _is_deprecated_chatgpt_model,
+)
 
 
 def _make_tokens(**overrides) -> TokenData:
@@ -77,10 +83,22 @@ class TestBuildChatCodexWithTokens:
             patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
             patch(_CHAT_CODEX) as MockChatCodex,
         ):
-            _build_chatcodex(model="gpt-5.1-codex")
+            _build_chatcodex(model="gpt-5.4-mini")
 
         _, kwargs = MockChatCodex.call_args
-        assert kwargs["model"] == "gpt-5.1-codex"
+        assert kwargs["model"] == "gpt-5.4-mini"
+
+    def test_default_model_used_when_omitted(self) -> None:
+        tokens = _make_tokens()
+        with (
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
+            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_CHAT_CODEX) as MockChatCodex,
+        ):
+            _build_chatcodex()
+
+        _, kwargs = MockChatCodex.call_args
+        assert kwargs["model"] == DEFAULT_CHATGPT_MODEL
 
     def test_extra_kwargs_forwarded(self) -> None:
         tokens = _make_tokens()
@@ -244,3 +262,83 @@ class TestChatCodexInstructions:
         payload = model._get_request_payload(messages)
         assert "First instruction." in payload["instructions"]
         assert "Second instruction." in payload["instructions"]
+
+
+# ---------------------------------------------------------------------------
+# Supported model list + deprecation gate
+# ---------------------------------------------------------------------------
+
+
+class TestChatGPTModelList:
+    """Verify the hand-maintained supported-model list."""
+
+    def test_default_is_in_supported_list(self) -> None:
+        assert DEFAULT_CHATGPT_MODEL in CHATGPT_MODELS
+
+    def test_known_models_present(self) -> None:
+        # Spot-check the models expected from the upstream Codex catalog.
+        for expected in ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"):
+            assert expected in CHATGPT_MODELS
+
+    def test_deprecated_old_gpt5_families(self) -> None:
+        for deprecated in (
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.1-codex",
+            "gpt-5.0",
+            "gpt-5-mini",
+            "gpt-4o",
+        ):
+            assert _is_deprecated_chatgpt_model(deprecated), (
+                f"{deprecated} should be flagged as deprecated"
+            )
+
+    def test_supported_models_not_deprecated(self) -> None:
+        for model in CHATGPT_MODELS:
+            assert not _is_deprecated_chatgpt_model(model)
+
+    def test_unknown_forward_compat_not_deprecated(self) -> None:
+        # Unknown but plausible future IDs should pass the deprecation gate
+        # (they'll trigger a warning, not an error).
+        assert not _is_deprecated_chatgpt_model("gpt-5.5")
+        assert not _is_deprecated_chatgpt_model("gpt-6")
+
+
+class TestBuildChatCodexDeprecationGate:
+    """``_build_chatcodex`` must reject deprecated models up-front."""
+
+    def test_raises_on_deprecated_model(self) -> None:
+        tokens = _make_tokens()
+        with (
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
+            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_CHAT_CODEX),
+        ):
+            with pytest.raises(ValueError, match="deprecated"):
+                _build_chatcodex(model="gpt-5.2-codex")
+
+    def test_deprecated_model_error_lists_alternatives(self) -> None:
+        tokens = _make_tokens()
+        with (
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
+            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_CHAT_CODEX),
+        ):
+            with pytest.raises(ValueError) as excinfo:
+                _build_chatcodex(model="gpt-5.1-codex")
+        # Error message should surface the supported alternatives.
+        for model in CHATGPT_MODELS:
+            assert model in str(excinfo.value)
+
+    def test_unknown_model_warns_but_proceeds(self, caplog) -> None:
+        tokens = _make_tokens()
+        with (
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=tokens),
+            patch("deepagents._chatgpt_auth.refresh_if_needed", return_value=tokens),
+            patch(_CHAT_CODEX) as MockChatCodex,
+            caplog.at_level("WARNING", logger="deepagents._chatgpt_model"),
+        ):
+            _build_chatcodex(model="gpt-6-codex")
+
+        MockChatCodex.assert_called_once()
+        assert any("forward-compat" in rec.message for rec in caplog.records)
