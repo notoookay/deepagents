@@ -9,9 +9,16 @@ Reads the canonical project layout:
     .env             # optional — environment variables
     mcp.json         # optional — HTTP/SSE MCP servers
     skills/          # optional — auto-seeded into skills namespace
+    user/            # optional — per-user writable memory
+        AGENTS.md    # optional — seeded as empty if not provided
 ```
 
 ...and writes everything `langgraph deploy` needs to a build directory.
+
+AGENTS.md and skills are read-only at runtime.  When a ``user/``
+directory is present, a per-user ``AGENTS.md`` is seeded (from
+``user/AGENTS.md`` if provided, otherwise empty) and is writable
+at runtime.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from deepagents_cli.deploy.config import (
     AGENTS_MD_FILENAME,
     MCP_FILENAME,
     SKILLS_DIRNAME,
+    USER_DIRNAME,
     DeployConfig,
 )
 from deepagents_cli.deploy.templates import (
@@ -36,13 +44,22 @@ from deepagents_cli.deploy.templates import (
 
 logger = logging.getLogger(__name__)
 
-_MODEL_PROVIDER_DEPS = {
+_MODEL_PROVIDER_DEPS: dict[str, str] = {
     "anthropic": "langchain-anthropic",
-    "openai": "langchain-openai",
+    "azure_openai": "langchain-openai",
+    "baseten": "langchain-baseten",
+    "cohere": "langchain-cohere",
+    "deepseek": "langchain-deepseek",
+    "fireworks": "langchain-fireworks",
     "google_genai": "langchain-google-genai",
     "google_vertexai": "langchain-google-vertexai",
     "groq": "langchain-groq",
     "mistralai": "langchain-mistralai",
+    "nvidia": "langchain-nvidia-ai-endpoints",
+    "openai": "langchain-openai",
+    "openrouter": "langchain-openrouter",
+    "perplexity": "langchain-perplexity",
+    "xai": "langchain-xai",
 }
 """Dependencies inferred from a provider: prefix on the model string."""
 
@@ -66,9 +83,10 @@ def bundle(
         encoding="utf-8",
     )
     logger.info(
-        "Wrote _seed.json (memories: %d, skills: %d)",
+        "Wrote _seed.json (memories: %d, skills: %d, user_memories: %d)",
         len(seed["memories"]),
         len(seed["skills"]),
+        len(seed.get("user_memories", {})),
     )
 
     # 3. Copy mcp.json if present.
@@ -87,8 +105,13 @@ def bundle(
         logger.info("Copied %s → .env", env_src)
 
     # 4. Render deploy_graph.py.
+    has_user_memories = (project_root / USER_DIRNAME).is_dir()
     (build_dir / "deploy_graph.py").write_text(
-        _render_deploy_graph(config, mcp_present=mcp_present),
+        _render_deploy_graph(
+            config,
+            mcp_present=mcp_present,
+            has_user_memories=has_user_memories,
+        ),
         encoding="utf-8",
     )
     logger.info("Generated deploy_graph.py")
@@ -112,32 +135,25 @@ def _build_seed(
     config: DeployConfig,  # noqa: ARG001
     project_root: Path,
     system_prompt: str,
-) -> dict[str, dict[str, str]]:
+) -> dict:
     """Build the `_seed.json` payload.
 
-    Layout:
+    Layout::
 
-    ```txt
-    {
-        "memories": { "/AGENTS.md": "..." },
-        "skills":   { "/<skill>/SKILL.md": "...", ... }
-    }
-    ```
+        {
+            "memories":       { "/AGENTS.md": "..." },
+            "skills":         { "/<skill>/SKILL.md": "...", ... },
+            "user_memories":  { "/AGENTS.md": "..." }
+        }
 
-    `memories` always contains `/AGENTS.md` — the agent reads it at runtime
-    via `/memories/AGENTS.md`. Writes and edits to that path are blocked
-    by `ReadOnlyStoreBackend` in the generated graph.
-
-    `skills` walks `skills/` if present. Keys are paths relative to the
-    skills dir with a leading slash; the runtime namespace handles the
-    scoping.
+    ``memories`` and ``skills`` are read-only at runtime.
+    ``user_memories`` contains a single writable ``AGENTS.md`` mounted at
+    ``/memories/user/``, namespaced per user_id.  If the project has a
+    ``user/`` directory (even if empty), an ``AGENTS.md`` is always seeded.
     """
-    # Keys must match what CompositeBackend passes to the mounted
-    # StoreBackend after stripping the route prefix: for a read of
-    # /memories/AGENTS.md it calls store.read("/AGENTS.md").
-    # Seed with the same leading-slash convention.
     memories: dict[str, str] = {f"/{AGENTS_MD_FILENAME}": system_prompt}
     skills: dict[str, str] = {}
+    user_memories: dict[str, str] = {}
 
     skills_dir = project_root / SKILLS_DIRNAME
     if skills_dir.is_dir():
@@ -146,13 +162,28 @@ def _build_seed(
                 rel = f.relative_to(skills_dir).as_posix()
                 skills[f"/{rel}"] = f.read_text(encoding="utf-8")
 
-    return {"memories": memories, "skills": skills}
+    user_dir = project_root / USER_DIRNAME
+    if user_dir.is_dir():
+        user_agents_md = user_dir / AGENTS_MD_FILENAME
+        content = (
+            user_agents_md.read_text(encoding="utf-8")
+            if user_agents_md.is_file()
+            else ""
+        )
+        user_memories[f"/{AGENTS_MD_FILENAME}"] = content
+
+    return {
+        "memories": memories,
+        "skills": skills,
+        "user_memories": user_memories,
+    }
 
 
 def _render_deploy_graph(
     config: DeployConfig,
     *,
     mcp_present: bool,
+    has_user_memories: bool = False,
 ) -> str:
     """Render the generated `deploy_graph.py`."""
     provider = config.sandbox.provider
@@ -177,6 +208,7 @@ def _render_deploy_graph(
         mcp_tools_block=mcp_tools_block,
         mcp_tools_load_call=mcp_tools_load_call,
         default_assistant_id=config.agent.name,
+        has_user_memories=has_user_memories,
     )
 
 
@@ -245,6 +277,12 @@ def print_bundle_summary(config: DeployConfig, build_dir: Path) -> None:
     if memory_files:
         print(f"\n  Memory seed ({len(memory_files)} file(s)):")
         for f in memory_files:
+            print(f"    {f}")
+
+    user_memory_files = sorted(seed.get("user_memories", {}).keys())
+    if user_memory_files:
+        print(f"\n  User memory seed ({len(user_memory_files)} file(s)):")
+        for f in user_memory_files:
             print(f"    {f}")
 
     skills_files = sorted(seed.get("skills", {}).keys())
