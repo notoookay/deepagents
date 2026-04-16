@@ -1,0 +1,128 @@
+# Daily upstream sync from langchain/deepagents.
+#
+# Runs every day at 00:00 UTC (and can be triggered manually).
+# If upstream has new commits, creates a dated branch and opens a PR.
+# The PR title is flagged with a warning if merge conflicts were detected.
+
+name: "🔄 Daily Upstream Sync"
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/langchain/deepagents.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          MERGE_BASE=$(git merge-base HEAD upstream/main)
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          if [ "$MERGE_BASE" = "$UPSTREAM_SHA" ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "Already up to date with upstream. Nothing to sync."
+          else
+            AHEAD=$(git rev-list HEAD..upstream/main --count)
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Upstream has $AHEAD new commit(s)."
+          fi
+
+      - name: Check if sync branch already exists
+        if: steps.check.outputs.has_changes == 'true'
+        id: branch_check
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          BRANCH="upstream-sync/${DATE}"
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "already_exists=true" >> $GITHUB_OUTPUT
+            echo "Branch $BRANCH already exists. Skipping."
+          else
+            echo "already_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch and merge
+        if: steps.check.outputs.has_changes == 'true' && steps.branch_check.outputs.already_exists == 'false'
+        id: sync
+        run: |
+          BRANCH="${{ steps.branch_check.outputs.branch }}"
+          git checkout -b "$BRANCH"
+
+          if git merge upstream/main --no-edit -m "chore: sync with upstream langchain/deepagents"; then
+            echo "status=clean" >> $GITHUB_OUTPUT
+          else
+            echo "status=conflict" >> $GITHUB_OUTPUT
+            # Stage conflicted files so they can be committed and inspected via the PR
+            git add -A
+            git commit -m "chore: sync with upstream langchain/deepagents (⚠️ resolve conflicts)"
+          fi
+
+      - name: Push sync branch
+        if: steps.check.outputs.has_changes == 'true' && steps.branch_check.outputs.already_exists == 'false'
+        run: git push -u origin ${{ steps.branch_check.outputs.branch }}
+
+      - name: Open PR
+        if: steps.check.outputs.has_changes == 'true' && steps.branch_check.outputs.already_exists == 'false'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          SYNC_BRANCH: ${{ steps.branch_check.outputs.branch }}
+          SYNC_STATUS: ${{ steps.sync.outputs.status }}
+        with:
+          script: |
+            const branch = process.env.SYNC_BRANCH;
+            const status = process.env.SYNC_STATUS;
+            const date = new Date().toISOString().slice(0, 10);
+            const isClean = status === 'clean';
+
+            const title = isClean
+              ? `chore: sync with upstream langchain/deepagents (${date})`
+              : `chore: sync with upstream langchain/deepagents (${date}) ⚠️ conflicts`;
+
+            const body = isClean
+              ? [
+                  '## Upstream Sync',
+                  '',
+                  'Automated daily sync from [`langchain/deepagents`](https://github.com/langchain/deepagents).',
+                  '',
+                  '**No merge conflicts detected.** Review the changes and merge when ready.',
+                ].join('\n')
+              : [
+                  '## Upstream Sync — ⚠️ Conflicts Detected',
+                  '',
+                  'Automated daily sync from [`langchain/deepagents`](https://github.com/langchain/deepagents).',
+                  '',
+                  '**Merge conflicts were found.** Please resolve the conflict markers in the affected files before merging.',
+                ].join('\n');
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              head: branch,
+              base: 'main',
+              body,
+            });
+
+            core.notice(`Created PR #${pr.number}: ${pr.html_url}`);
