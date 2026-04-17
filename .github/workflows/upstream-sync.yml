@@ -3,6 +3,10 @@
 # Runs every day at 00:00 UTC (and can be triggered manually).
 # If main can be fast-forwarded to upstream, pushes directly to main.
 # If main has diverged, creates/updates a fixed review branch and opens a PR.
+#
+# Required secret:
+# - UPSTREAM_SYNC_TOKEN: fine-grained PAT or GitHub App token with
+#   `contents: write` and `workflows: write` permissions.
 
 name: "🔄 Daily Upstream Sync"
 
@@ -12,33 +16,49 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
-  actions: write
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      REVIEW_BRANCH: upstream-sync-review
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify sync token is configured
+        run: |
+          if [ -z "${{ secrets.UPSTREAM_SYNC_TOKEN }}" ]; then
+            echo "::error::Missing required secret: UPSTREAM_SYNC_TOKEN"
+            echo "::error::Create a token with contents:write + workflows:write and store it as UPSTREAM_SYNC_TOKEN."
+            exit 1
+          fi
 
       - name: Sync main with upstream
         id: sync
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           if git remote get-url upstream >/dev/null 2>&1; then
             git remote set-url upstream https://github.com/langchain-ai/deepagents.git
           else
             git remote add upstream https://github.com/langchain-ai/deepagents.git
           fi
-          git fetch upstream main
-          git fetch origin main
+          git fetch --no-tags upstream main
+          git fetch --no-tags origin main
 
           if git merge-base --is-ancestor origin/main upstream/main; then
             git checkout -B main origin/main
@@ -51,19 +71,18 @@ jobs:
             exit 0
           fi
 
-          review_branch="upstream-sync-review"
-          git checkout -B "$review_branch" upstream/main
-          remote_sha="$(git ls-remote --heads origin "$review_branch" | awk '{print $1}')"
+          git checkout -B "$REVIEW_BRANCH" upstream/main
+          remote_sha="$(git ls-remote --heads origin "$REVIEW_BRANCH" | awk '{print $1}')"
           if [ -n "$remote_sha" ]; then
-            git push --force-with-lease="refs/heads/${review_branch}:${remote_sha}" origin "$review_branch"
+            git push --force-with-lease="refs/heads/${REVIEW_BRANCH}:${remote_sha}" origin "$REVIEW_BRANCH"
           else
-            git push --force-with-lease="refs/heads/${review_branch}" origin "$review_branch"
+            git push --force-with-lease="refs/heads/${REVIEW_BRANCH}" origin "$REVIEW_BRANCH"
           fi
 
           echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
-          echo "Created/updated branch '$review_branch' for manual review."
+          echo "Created/updated branch '$REVIEW_BRANCH' for manual review."
           echo "needs_review=true" >> "$GITHUB_OUTPUT"
-          echo "review_branch=$review_branch" >> "$GITHUB_OUTPUT"
+          echo "review_branch=$REVIEW_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Open manual review PR when branches diverge
         if: steps.sync.outputs.needs_review == 'true'
