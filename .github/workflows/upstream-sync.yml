@@ -19,7 +19,6 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
       pull-requests: write
     steps:
       - name: Verify sync token is configured
@@ -28,7 +27,7 @@ jobs:
         run: |
           if [ -z "$SYNC_TOKEN" ]; then
             echo "::error::Missing required secret: UPSTREAM_SYNC_TOKEN"
-            echo "::error::Create a token with contents:write + workflows:write and store it as UPSTREAM_SYNC_TOKEN."
+            echo "::error::Create a token with contents: write and workflows: write, then store it as UPSTREAM_SYNC_TOKEN."
             exit 1
           fi
 
