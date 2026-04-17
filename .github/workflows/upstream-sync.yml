@@ -3,6 +3,10 @@
 # Runs every day at 00:00 UTC (and can be triggered manually).
 # If upstream has new commits, creates a dated branch and opens a PR.
 # The PR title is flagged with a warning if merge conflicts were detected.
+#
+# Requires a repository secret named SYNC_PAT: a Personal Access Token with
+# the `repo` and `workflow` scopes. GITHUB_TOKEN cannot push workflow file
+# changes even with `workflows: write` in certain GitHub configurations.
 
 name: "🔄 Daily Upstream Sync"
 
@@ -24,7 +28,8 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # PAT with `repo` + `workflow` scopes required to push workflow file changes
+          token: ${{ secrets.SYNC_PAT }}
 
       - name: Configure git
         run: |
