@@ -25,8 +25,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-    env:
-      REVIEW_BRANCH: upstream-sync-review
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -35,8 +33,10 @@ jobs:
           persist-credentials: false
 
       - name: Verify sync token is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: |
-          if [ -z "${{ secrets.UPSTREAM_SYNC_TOKEN }}" ]; then
+          if [ -z "$SYNC_TOKEN" ]; then
             echo "::error::Missing required secret: UPSTREAM_SYNC_TOKEN"
             echo "::error::Create a token with contents:write + workflows:write and store it as UPSTREAM_SYNC_TOKEN."
             exit 1
@@ -46,6 +46,7 @@ jobs:
         id: sync
         env:
           SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          REVIEW_BRANCH: upstream-sync-review
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -57,8 +58,8 @@ jobs:
           else
             git remote add upstream https://github.com/langchain-ai/deepagents.git
           fi
-          git fetch --no-tags upstream main
-          git fetch --no-tags origin main
+          git fetch upstream main
+          git fetch origin main
 
           if git merge-base --is-ancestor origin/main upstream/main; then
             git checkout -B main origin/main
