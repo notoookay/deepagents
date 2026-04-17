@@ -3,6 +3,10 @@
 # Runs every day at 00:00 UTC (and can be triggered manually).
 # If main can be fast-forwarded to upstream, pushes directly to main.
 # If main has diverged, creates/updates a fixed review branch and opens a PR.
+#
+# Required secret:
+# - UPSTREAM_SYNC_TOKEN: fine-grained PAT or GitHub App token with
+#   `contents: write` and `workflows: write` permissions.
 
 name: "🔄 Daily Upstream Sync"
 
@@ -11,22 +15,32 @@ on:
     - cron: "0 0 * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
-  actions: write
-
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
+      - name: Verify sync token is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Missing required secret: UPSTREAM_SYNC_TOKEN"
+            echo "::error::Create a token with contents: write and workflows: write, then store it as UPSTREAM_SYNC_TOKEN."
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
 
       - name: Sync main with upstream
         id: sync
+        env:
+          REVIEW_BRANCH: upstream-sync-review
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -51,19 +65,18 @@ jobs:
             exit 0
           fi
 
-          review_branch="upstream-sync-review"
-          git checkout -B "$review_branch" upstream/main
-          remote_sha="$(git ls-remote --heads origin "$review_branch" | awk '{print $1}')"
+          git checkout -B "$REVIEW_BRANCH" upstream/main
+          remote_sha="$(git ls-remote --heads origin "$REVIEW_BRANCH" | awk '{print $1}')"
           if [ -n "$remote_sha" ]; then
-            git push --force-with-lease="refs/heads/${review_branch}:${remote_sha}" origin "$review_branch"
+            git push --force-with-lease="refs/heads/${REVIEW_BRANCH}:${remote_sha}" origin "$REVIEW_BRANCH"
           else
-            git push --force-with-lease="refs/heads/${review_branch}" origin "$review_branch"
+            git push --force-with-lease="refs/heads/${REVIEW_BRANCH}" origin "$REVIEW_BRANCH"
           fi
 
           echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
-          echo "Created/updated branch '$review_branch' for manual review."
+          echo "Created/updated branch '$REVIEW_BRANCH' for manual review."
           echo "needs_review=true" >> "$GITHUB_OUTPUT"
-          echo "review_branch=$review_branch" >> "$GITHUB_OUTPUT"
+          echo "review_branch=$REVIEW_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Open manual review PR when branches diverge
         if: steps.sync.outputs.needs_review == 'true'
