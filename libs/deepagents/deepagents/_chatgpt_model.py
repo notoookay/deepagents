@@ -98,6 +98,24 @@ class ChatCodex(ChatOpenAI):
       string instead of a list of Responses API content blocks.
     """
 
+    def _refresh_credentials(self) -> None:
+        """Refresh the OAuth access token if expired, updating the wrapped clients.
+
+        The access token is baked into ``root_client.api_key`` (and its async
+        counterpart) at construction. Long-lived sessions would otherwise 401
+        once the original token expires; calling this before each request
+        picks up a refreshed token from disk on demand.
+        """
+        tokens = load_tokens()
+        if tokens is None:
+            return
+        tokens = refresh_if_needed(tokens)
+        access_token = tokens["access_token"]
+        if self.root_client is not None:
+            self.root_client.api_key = access_token
+        if self.root_async_client is not None:
+            self.root_async_client.api_key = access_token
+
     def _get_request_payload(
         self,
         input_: Any,  # noqa: ANN401
@@ -144,6 +162,7 @@ class ChatCodex(ChatOpenAI):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self._refresh_credentials()
         result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
         return _normalize_result(result)
 
@@ -154,6 +173,7 @@ class ChatCodex(ChatOpenAI):
         run_manager: CallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
+        self._refresh_credentials()
         for chunk in super()._stream(messages, stop=stop, run_manager=run_manager, **kwargs):
             if isinstance(chunk.message, AIMessageChunk):
                 chunk.message.content = _flatten_content(chunk.message.content)
@@ -166,6 +186,7 @@ class ChatCodex(ChatOpenAI):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self._refresh_credentials()
         result = await super()._agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
         return _normalize_result(result)
 
@@ -176,6 +197,7 @@ class ChatCodex(ChatOpenAI):
         run_manager: AsyncCallbackManagerForLLMRun | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
+        self._refresh_credentials()
         async for chunk in super()._astream(messages, stop=stop, run_manager=run_manager, **kwargs):
             if isinstance(chunk.message, AIMessageChunk):
                 chunk.message.content = _flatten_content(chunk.message.content)
