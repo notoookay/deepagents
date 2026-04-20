@@ -304,6 +304,66 @@ class TestChatGPTModelList:
         assert not _is_deprecated_chatgpt_model("gpt-6")
 
 
+class TestChatCodexRefreshCredentials:
+    """``ChatCodex`` must refresh its OAuth token before each request."""
+
+    def _make_model(self) -> ChatCodex:
+        return ChatCodex(
+            model="gpt-5.3-codex",
+            api_key="stale-token",  # type: ignore[arg-type]
+        )
+
+    def test_generate_refreshes_token_on_underlying_clients(self) -> None:
+        fresh = _make_tokens(access_token="fresh-token")  # noqa: S106
+        model = self._make_model()
+        with (
+            patch(_LOAD_TOKENS, return_value=fresh),
+            patch(_REFRESH, return_value=fresh) as mock_refresh,
+            patch.object(ChatCodex, "_get_request_payload"),
+            patch(
+                "langchain_openai.ChatOpenAI._generate",
+                return_value=MagicMock(generations=[]),
+            ),
+        ):
+            model._generate([HumanMessage(content="hi")])
+
+        mock_refresh.assert_called_once()
+        assert model.root_client.api_key == "fresh-token"
+        assert model.root_async_client.api_key == "fresh-token"
+
+    def test_refresh_noop_when_no_tokens_on_disk(self) -> None:
+        """If tokens can't be loaded, skip refresh rather than crash.
+
+        This keeps ``ChatCodex`` usable in tests that construct it with a
+        fake api_key without a tokens file on disk.
+        """
+        model = self._make_model()
+        original_key = model.root_client.api_key
+        with (
+            patch(_LOAD_TOKENS, return_value=None),
+            patch(_REFRESH) as mock_refresh,
+        ):
+            model._refresh_credentials()
+
+        mock_refresh.assert_not_called()
+        assert model.root_client.api_key == original_key
+
+    def test_refresh_propagates_between_successive_calls(self) -> None:
+        """A second call after ``expires_at`` passes should trigger a refresh."""
+        expired = _make_tokens(access_token="old", expires_at=time.time() - 1)  # noqa: S106
+        fresh = _make_tokens(access_token="new")  # noqa: S106
+        model = self._make_model()
+        with (
+            patch(_LOAD_TOKENS, return_value=expired),
+            patch(_REFRESH, return_value=fresh) as mock_refresh,
+        ):
+            model._refresh_credentials()
+            model._refresh_credentials()
+
+        assert mock_refresh.call_count == 2
+        assert model.root_client.api_key == "new"
+
+
 class TestBuildChatCodexDeprecationGate:
     """``_build_chatcodex`` must reject deprecated models up-front."""
 
