@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.0.6](https://github.com/notoookay/deepagents/compare/langchain-daytona==0.0.5...langchain-daytona==0.0.6) (2026-04-25)
+
+
+### Bug Fixes
+
+* **deepagents:** remove old integration tests ([#2728](https://github.com/notoookay/deepagents/issues/2728)) ([6653197](https://github.com/notoookay/deepagents/commit/6653197b6cbec6dd1ca23d9f90bc1439ca26e6e5))
+
+## Changelog
+
 ---
 
 ## Prior Releases
