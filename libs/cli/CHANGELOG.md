@@ -1,5 +1,80 @@
 # Changelog
 
+## [0.0.50](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.49...deepagents-cli==0.0.50) (2026-05-04)
+
+### Bug Fixes
+
+* Show detached HEAD commit in local context ([#3144](https://github.com/langchain-ai/deepagents/issues/3144)) ([569d4f0](https://github.com/langchain-ai/deepagents/commit/569d4f0d7d699bace7820eb171a6bd605b2a1a18))
+
+## [0.0.49](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.48...deepagents-cli==0.0.49) (2026-05-04)
+
+### Features
+
+* First-run onboarding flow ([#3102](https://github.com/langchain-ai/deepagents/issues/3102)) ([a71f852](https://github.com/langchain-ai/deepagents/commit/a71f852df3e491326b8eaa03ee7cb7b3b94fe73d))
+* In-TUI API key entry via `/auth` ([#3123](https://github.com/langchain-ai/deepagents/issues/3123)) ([eedbc3a](https://github.com/langchain-ai/deepagents/commit/eedbc3a8b5f88059636e497f72c7cec5a420f998))
+* Richer provider auth states, hosted Ollama auth ([#3111](https://github.com/langchain-ai/deepagents/issues/3111)) ([eeaeb76](https://github.com/langchain-ai/deepagents/commit/eeaeb7663515eb0cfa8f0389e7f8446e95e84911))
+* Set-as-default in `/agents` picker, harden persistence ([#3126](https://github.com/langchain-ai/deepagents/issues/3126)) ([4751e33](https://github.com/langchain-ai/deepagents/commit/4751e33fbad5945a740cae03bda758223201433b))
+
+### Bug Fixes
+
+* Gate async task tools by actual names ([#3094](https://github.com/langchain-ai/deepagents/issues/3094)) ([aae8dfe](https://github.com/langchain-ai/deepagents/commit/aae8dfebab184586322129ec162e083ebfd372cc))
+* Hide approval menu on selection ([#3097](https://github.com/langchain-ai/deepagents/issues/3097)) ([7dafd30](https://github.com/langchain-ai/deepagents/commit/7dafd3049ad7725353bbf12bf80f476b52916208))
+* Move internal state under hidden directory ([#3106](https://github.com/langchain-ai/deepagents/issues/3106)) ([ef4c717](https://github.com/langchain-ai/deepagents/commit/ef4c71763086a4e4899ba7ced6f9eb478d38069e))
+* Preserve recent agent across thread resume ([#3108](https://github.com/langchain-ai/deepagents/issues/3108)) ([442a0d4](https://github.com/langchain-ai/deepagents/commit/442a0d474aa1e767d542cb01f6e338431c18e5a8))
+
+## [0.0.48](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.47...deepagents-cli==0.0.48) (2026-05-01)
+
+### Bug Fixes
+
+* Apply `--model-params` on `/model` re-select ([#3072](https://github.com/langchain-ai/deepagents/issues/3072)) ([50546dd](https://github.com/langchain-ai/deepagents/commit/50546dd3d368af297084929ee3aa91ccf8496fca))
+
+## [0.0.47](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.46...deepagents-cli==0.0.47) (2026-05-01)
+
+### Features
+
+* Auto-discover Textual built-in themes ([#3068](https://github.com/langchain-ai/deepagents/issues/3068)) ([27894e3](https://github.com/langchain-ai/deepagents/commit/27894e336f20f270fb4bb685bf979f24b9bea0bc))
+
+### Bug Fixes
+
+* Recover from failed server startup via `/model` ([#3056](https://github.com/langchain-ai/deepagents/issues/3056)) ([6ee375e](https://github.com/langchain-ai/deepagents/commit/6ee375e979b672cd1d172669f0e5a7a665431d7c))
+
+## [0.0.46](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.45...deepagents-cli==0.0.46) (2026-04-30)
+
+### Features
+
+* Rework MCP integration and add OAuth login ([#2906](https://github.com/langchain-ai/deepagents/issues/2906)) ([6b7b0be](https://github.com/langchain-ai/deepagents/commit/6b7b0bef95db673fed23fc92803abaaa398b0a6d))
+* `allowedTools` and `disabledTools` filters in MCP config ([#2835](https://github.com/langchain-ai/deepagents/issues/2835)) ([eafd691](https://github.com/langchain-ai/deepagents/commit/eafd6912db637ab59085a0b05d6e36d6cdd10e1a))
+
+## [0.0.45](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.44...deepagents-cli==0.0.45) (2026-04-30)
+
+### Bug Fixes
+
+* Reject out-of-tree symlinked project `AGENTS.md` ([#3039](https://github.com/langchain-ai/deepagents/issues/3039)) ([4618098](https://github.com/langchain-ai/deepagents/commit/4618098e59c8c8d1d3f91354e4f4163a9582f710))
+* Support modified backspace word deletion ([#3037](https://github.com/langchain-ai/deepagents/issues/3037)) ([bc3d019](https://github.com/langchain-ai/deepagents/commit/bc3d01916d2ba34be07d56c9eb9b813008c1584c))
+
+## [0.0.44](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.43...deepagents-cli==0.0.44) (2026-04-29)
+
+### Bug Fixes
+
+* Startup import deadlock ([#3017](https://github.com/langchain-ai/deepagents/issues/3017)) ([d40ab57](https://github.com/langchain-ai/deepagents/commit/d40ab57800a6ad12b0c9a5e249753702ec0832c8))
+
+## [0.0.43](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.42...deepagents-cli==0.0.43) (2026-04-29)
+
+### Features
+
+* Bundled chat frontend for deepagent deploy ([#2940](https://github.com/langchain-ai/deepagents/issues/2940)) ([9bde0c7](https://github.com/langchain-ai/deepagents/commit/9bde0c7835ded20e80466d8361f40784141d68d8))
+
+## [0.0.42](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.41...deepagents-cli==0.0.42) (2026-04-29)
+
+### Features
+
+* `shift+enter` newline on kitty-capable terminals ([#2869](https://github.com/langchain-ai/deepagents/issues/2869)) ([34e6614](https://github.com/langchain-ai/deepagents/commit/34e6614a2c6e6a7e33f763ac5b527c13b324a690))
+* Hint `Enter` behavior in `/model` empty state ([#2933](https://github.com/langchain-ai/deepagents/issues/2933)) ([7cffa16](https://github.com/langchain-ai/deepagents/commit/7cffa16a072bc77def78e4cda09c2e5a2cf8ca39))
+
+### Bug Fixes
+
+* Queue `/model` switches during server startup ([#2895](https://github.com/langchain-ai/deepagents/issues/2895)) ([6ed7b65](https://github.com/langchain-ai/deepagents/commit/6ed7b65a40ac5bd926e94edd944bd552e8d6b5b4))
+
 ## [0.0.41](https://github.com/langchain-ai/deepagents/compare/deepagents-cli==0.0.40...deepagents-cli==0.0.41) (2026-04-21)
 
 ### Features

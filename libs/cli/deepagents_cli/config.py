@@ -1846,20 +1846,15 @@ def _get_default_model_spec() -> str:
 
         return f"chatgpt:{DEFAULT_CHATGPT_MODEL}"
     if s.has_openai:
-        return "openai:gpt-5.2"
+        return "openai:gpt-5.5"
     if s.has_anthropic:
-        return "anthropic:claude-sonnet-4-6"
+        return "anthropic:claude-opus-4-7"
     if s.has_google:
         return "google_genai:gemini-3.1-pro-preview"
-    if s.has_vertex_ai:
-        return "google_vertexai:gemini-3.1-pro-preview"
-    if s.has_nvidia:
-        return "nvidia:nvidia/nemotron-3-super-120b-a12b"
 
     msg = (
         "No credentials configured. Please set one of: "
-        "ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, "
-        "GOOGLE_CLOUD_PROJECT, or NVIDIA_API_KEY"
+        "ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY"
     )
     raise ModelConfigError(msg)
 
@@ -1876,36 +1871,52 @@ _OPENROUTER_APP_TITLE = "Deep Agents CLI"
 _OPENROUTER_APP_CATEGORIES: list[str] = ["cli-agent"]
 """Default `app_categories` (maps to `X-OpenRouter-Categories`) for OpenRouter."""
 
+_cli_openrouter_profile_registered = False
+"""Process-wide guard so the CLI OpenRouter profile is registered exactly once."""
 
-def _apply_openrouter_defaults(kwargs: dict[str, Any]) -> None:
-    """Inject default OpenRouter attribution kwargs.
 
-    Sets `app_url`, `app_title`, and `app_categories` via `setdefault` so
-    that user-supplied values in config take precedence. These map to the
-    `HTTP-Referer`, `X-Title`, and `X-OpenRouter-Categories` headers that
-    `ChatOpenRouter` sends for app attribution
-    (see https://openrouter.ai/docs/app-attribution).
+def _cli_openrouter_attribution_kwargs() -> dict[str, Any]:
+    """CLI-specific OpenRouter attribution kwargs.
 
-    Users can override either value provider-wide or per-model in
-    `~/.deepagents/config.toml`:
+    Layered on top of the SDK's built-in factory via profile stacking; these
+    values override the SDK defaults but still sit beneath any caller-supplied
+    `kwargs` (i.e. `config.toml`-resolved values), preserving the precedence
+    documented on `apply_provider_profile`.
 
-    ```toml
-    # Provider-wide
-    [models.providers.openrouter.params]
-    app_url = "https://myapp.com"
-    app_title = "My App"
-
-    # Per-model (shallow-merges on top of provider-wide)
-    [models.providers.openrouter.params."openai/gpt-oss-120b"]
-    app_title = "My App (GPT)"
-    ```
-
-    Args:
-        kwargs: Mutable kwargs dict to update in place.
+    Returns:
+        Mapping of `app_url` and `app_title` to spread into `init_chat_model`.
     """
-    kwargs.setdefault("app_url", _OPENROUTER_APP_URL)
-    kwargs.setdefault("app_title", _OPENROUTER_APP_TITLE)
-    kwargs.setdefault("app_categories", _OPENROUTER_APP_CATEGORIES)
+    return {
+        "app_url": _OPENROUTER_APP_URL,
+        "app_title": _OPENROUTER_APP_TITLE,
+    }
+
+
+def _ensure_cli_openrouter_profile_registered() -> None:
+    """Stack the CLI OpenRouter attribution onto the SDK's built-in profile.
+
+    Stacking (vs. duplicating the inline `_get_provider_kwargs` path) means the
+    SDK's `pre_init` version check fires exactly once and the CLI's app-
+    attribution defaults are composed via the same `apply_provider_profile`
+    path used for every other provider. `register_provider_profile` merges on
+    top of the existing built-in registration: the CLI's `init_kwargs` and
+    factory output win on shared keys, while the built-in's `pre_init` and
+    factory still chain.
+    """
+    global _cli_openrouter_profile_registered  # noqa: PLW0603
+    if _cli_openrouter_profile_registered:
+        return
+
+    from deepagents.profiles.provider import ProviderProfile, register_provider_profile
+
+    register_provider_profile(
+        "openrouter",
+        ProviderProfile(
+            init_kwargs={"app_categories": _OPENROUTER_APP_CATEGORIES},
+            init_kwargs_factory=_cli_openrouter_attribution_kwargs,
+        ),
+    )
+    _cli_openrouter_profile_registered = True
 
 
 def _get_provider_kwargs(
@@ -1933,7 +1944,11 @@ def _get_provider_kwargs(
     base_url = config.get_base_url(provider)
     if base_url:
         result["base_url"] = base_url
-    from deepagents_cli.model_config import PROVIDER_API_KEY_ENV, resolve_env_var
+    from deepagents_cli.model_config import (
+        OPTIONAL_AUTH_ENV,
+        PROVIDER_API_KEY_ENV,
+        resolve_env_var,
+    )
 
     api_key_env = config.get_api_key_env(provider)
     if not api_key_env:
@@ -1949,13 +1964,38 @@ def _get_provider_kwargs(
         if api_key:
             result["api_key"] = api_key
 
-    if provider == "openrouter":
-        from deepagents.profiles._openrouter import (
-            check_openrouter_version,  # noqa: PLC2701
-        )
-
-        check_openrouter_version()
-        _apply_openrouter_defaults(result)
+    # `langchain-ollama` has no `api_key` kwarg; hosted Ollama (Cloud or
+    # gateway) needs the bearer token threaded through `client_kwargs.headers`.
+    if provider == "ollama":
+        optional_env = OPTIONAL_AUTH_ENV.get(provider)
+        optional_key = resolve_env_var(optional_env) if optional_env else None
+        if optional_key:
+            client_kwargs = result.get("client_kwargs")
+            if client_kwargs is not None and not isinstance(client_kwargs, dict):
+                logger.warning(
+                    "Provider 'ollama' has non-mapping client_kwargs (%s);"
+                    " skipping Authorization header injection",
+                    type(client_kwargs).__name__,
+                )
+            else:
+                client_kwargs = dict(client_kwargs) if client_kwargs else {}
+                headers = client_kwargs.get("headers")
+                if headers is not None and not isinstance(headers, dict):
+                    logger.warning(
+                        "Provider 'ollama' has non-mapping client_kwargs.headers"
+                        " (%s); skipping Authorization header injection",
+                        type(headers).__name__,
+                    )
+                else:
+                    headers = dict(headers) if headers else {}
+                    has_auth_header = any(
+                        isinstance(k, str) and k.lower() == "authorization"
+                        for k in headers
+                    )
+                    if not has_auth_header:
+                        headers["Authorization"] = f"Bearer {optional_key}"
+                        client_kwargs["headers"] = headers
+                        result["client_kwargs"] = client_kwargs
 
     return result
 
@@ -2039,11 +2079,15 @@ def _create_model_via_init(
         Instantiated `BaseChatModel`.
 
     Raises:
-        ModelConfigError: On import, value, or runtime errors.
+        UnknownProviderError: When `provider` is empty and
+            `init_chat_model` also fails to infer one. Carries the
+            model spec and docs URL as attributes so the UI can render
+            a clickable link.
+        ModelConfigError: On other import, value, or runtime errors.
     """
     from langchain.chat_models import init_chat_model
 
-    from deepagents_cli.model_config import ModelConfigError
+    from deepagents_cli.model_config import ModelConfigError, UnknownProviderError
 
     try:
         if provider:
@@ -2080,7 +2124,12 @@ def _create_model_via_init(
             )
         raise ModelConfigError(msg) from e
     except (ValueError, TypeError) as e:
-        spec = f"{provider}:{model_name}" if provider else model_name
+        if not provider:
+            # Both CLI auto-detection and `init_chat_model`'s own inference
+            # failed; surface a structured error so the UI can render the
+            # docs URL as a clickable link.
+            raise UnknownProviderError(model_spec=model_name) from e
+        spec = f"{provider}:{model_name}"
         msg = f"Invalid model configuration for '{spec}': {e}"
         raise ModelConfigError(msg) from e
     except Exception as e:  # provider SDK auth/network errors
@@ -2200,9 +2249,10 @@ def create_model(
         A `ModelResult` containing the model and its metadata.
 
     Raises:
-        ModelConfigError: If provider cannot be determined from the model name,
-            required provider package is not installed, or no credentials are
-            configured.
+        ModelConfigError: If provider cannot be determined from the model name
+            or required provider package is not installed.
+        MissingCredentialsError: If no credentials are configured for the
+            resolved provider.
 
     Examples:
         >>> model = create_model("anthropic:claude-sonnet-4-5")
@@ -2215,6 +2265,7 @@ def create_model(
         ModelConfig,
         ModelConfigError,
         ModelSpec,
+        apply_stored_credentials,
         get_credential_env_var,
         has_provider_credentials,
     )
@@ -2246,6 +2297,12 @@ def create_model(
         # Bare model name — auto-detect provider or let init_chat_model infer
         model_name = model_spec
         provider = detect_provider(model_spec) or ""
+
+    # Stored API keys (added via `/auth`) take effect by being copied onto
+    # the env var name LangChain reads. Apply before the credential check so
+    # `has_provider_credentials` and the downstream SDK see the same value.
+    if provider:
+        apply_stored_credentials(provider)
 
     # ChatGPT subscription — bypass init_chat_model entirely
     if provider == "chatgpt":
@@ -2279,15 +2336,49 @@ def create_model(
     if provider and provider not in IMPLICIT_AUTH_PROVIDERS:
         cred_status = has_provider_credentials(provider)
         if cred_status is False:
-            env_var = get_credential_env_var(provider) or f"<{provider} API key>"
+            from deepagents_cli.model_config import MissingCredentialsError
+
+            env_var = get_credential_env_var(provider)
+            display_env = env_var or f"<{provider} API key>"
             msg = (
                 f"No credentials found for provider '{provider}'. "
-                f"Please set the {env_var} environment variable."
+                f"Please set the {display_env} environment variable."
             )
-            raise ModelConfigError(msg)
+            raise MissingCredentialsError(msg, provider=provider, env_var=env_var)
 
     # Provider-specific kwargs (with per-model overrides)
     kwargs = _get_provider_kwargs(provider, model_name=model_name)
+
+    # Compose under existing kwargs: profile < config.toml < --model-params
+    # (applied below). The CLI's OpenRouter profile is stacked on top of the
+    # built-in SDK profile so its `pre_init` (version check) and factory
+    # (app attribution) compose into a single `apply_provider_profile` call.
+    if provider:
+        from deepagents.profiles.provider import apply_provider_profile
+
+        if provider == "openrouter":
+            _ensure_cli_openrouter_profile_registered()
+
+        spec = f"{provider}:{model_name}" if model_name else provider
+        try:
+            kwargs = apply_provider_profile(spec, kwargs)
+        except ModelConfigError:
+            raise
+        except Exception as exc:
+            # `pre_init` and `init_kwargs_factory` callables registered on a
+            # `ProviderProfile` may raise arbitrary exceptions (e.g. an
+            # `ImportError` from the OpenRouter min-version check). Surface
+            # them as `ModelConfigError` so the CLI's error path renders an
+            # actionable message instead of a raw stack trace.
+            logger.debug(
+                "ProviderProfile resolution for %r failed.", spec, exc_info=True
+            )
+            msg = (
+                f"Failed to apply provider profile for '{spec}': {exc}. "
+                f"Check that the provider package is installed and up to date, "
+                f"or set explicit kwargs via `--model-params`."
+            )
+            raise ModelConfigError(msg) from exc
 
     # CLI --model-params take highest priority
     if extra_kwargs:

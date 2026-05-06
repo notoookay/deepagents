@@ -25,6 +25,7 @@ from deepagents._chatgpt_auth import (
     _parse_token_response,
     delete_tokens,
     load_tokens,
+    login_device,
     refresh_if_needed,
     save_tokens,
 )
@@ -215,6 +216,15 @@ class TestTokenPersistence:
             save_tokens(tokens)
         mode = token_file.stat().st_mode & 0o777
         assert mode == 0o600
+        assert not token_file.with_suffix(".json.tmp").exists()
+
+    def test_save_locks_down_parent_directory(self, tmp_path: Path) -> None:
+        token_file = tmp_path / "chatgpt_tokens.json"
+        tokens = _make_token_data()
+        with patch("deepagents._chatgpt_auth._TOKEN_FILE", token_file):
+            save_tokens(tokens)
+        mode = token_file.parent.stat().st_mode & 0o777
+        assert mode == 0o700
 
 
 # ---------------------------------------------------------------------------
@@ -261,3 +271,44 @@ class TestRefreshIfNeeded:
         ):
             result = refresh_if_needed(tokens)
         assert result["refresh_token"] == "rt2"
+
+
+class TestDeviceLogin:
+    def test_prints_device_instructions(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Headless login must show the URL and code without requiring logging."""
+        token_file = tmp_path / "chatgpt_tokens.json"
+        token_resp = {
+            "access_token": _make_jwt({"chatgpt_account_id": "org-new"}),
+            "refresh_token": "refresh",
+            "expires_in": 3600,
+        }
+
+        with (
+            patch("deepagents._chatgpt_auth._TOKEN_FILE", token_file),
+            patch(
+                "deepagents._chatgpt_auth._post_json",
+                side_effect=[
+                    {
+                        "device_auth_id": "device-123",
+                        "user_code": "ABCD-EFGH",
+                        "interval": 1,
+                    },
+                    {
+                        "authorization_code": "auth-code",
+                        "code_verifier": "verifier",
+                    },
+                ],
+            ),
+            patch("deepagents._chatgpt_auth._post_form", return_value=token_resp),
+            patch("deepagents._chatgpt_auth.time.sleep"),
+        ):
+            tokens = login_device()
+
+        out = capsys.readouterr().out
+        assert "https://auth.openai.com/codex/device" in out
+        assert "ABCD-EFGH" in out
+        assert tokens["account_id"] == "org-new"

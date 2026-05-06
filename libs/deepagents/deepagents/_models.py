@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+import logging
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
 
-from deepagents.profiles import _get_harness_profile
+from deepagents.profiles.provider.provider_profiles import apply_provider_profile
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
@@ -15,11 +17,11 @@ def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
 
     If `model` is already a `BaseChatModel`, returns it unchanged.
 
-    String models are resolved via `init_chat_model`. OpenAI models
-    (prefixed with `openai:`) default to the Responses API.
-
-    OpenRouter models include default app attribution headers unless overridden
-    via `OPENROUTER_APP_URL` / `OPENROUTER_APP_TITLE` env vars.
+    String models are resolved via `init_chat_model`, composed with any
+    provider-specific initialization behavior registered in the
+    `ProviderProfile` registry. Built-in registrations supply the OpenAI
+    Responses API default and OpenRouter app attribution headers; users can
+    layer additional providers or overrides via `register_provider_profile`.
 
     ChatGPT subscription models (prefixed with `chatgpt:`) use OAuth tokens
     stored by ``deep-agents login openai`` and route to the Codex API.
@@ -42,26 +44,14 @@ def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
         model_name = model[len("chatgpt:") :]
         return _build_chatcodex(model=model_name) if model_name else _build_chatcodex()
 
-    profile = _get_harness_profile(model)
-
-    # Execute any pre-initialization logic
-    if profile.pre_init is not None:
-        profile.pre_init(model)
-
-    # Combine static and factory kwargs, with factory taking precedence
-    kwargs: dict[str, Any] = {**profile.init_kwargs}
-    if profile.init_kwargs_factory is not None:
-        kwargs.update(profile.init_kwargs_factory())
-
-    return init_chat_model(model, **kwargs)  # kwargs may be empty
+    return init_chat_model(model, **apply_provider_profile(model))
 
 
 def get_model_identifier(model: BaseChatModel) -> str | None:
     """Extract the provider-native model identifier from a chat model.
 
     Providers do not agree on a single field name for the identifier. Some use
-    `model_name`, while others use `model`. Reading the serialized model config
-    lets us inspect both without relying on reflective attribute access.
+    `model_name`, while others use `model`.
 
     Args:
         model: Chat model instance to inspect.
@@ -69,8 +59,7 @@ def get_model_identifier(model: BaseChatModel) -> str | None:
     Returns:
         The configured model identifier, or `None` if it is unavailable.
     """
-    config = model.model_dump()
-    return _string_value(config, "model_name") or _string_value(config, "model")
+    return _string_attr(model, "model_name") or _string_attr(model, "model")
 
 
 def get_model_provider(model: BaseChatModel) -> str | None:
@@ -88,7 +77,17 @@ def get_model_provider(model: BaseChatModel) -> str | None:
     """
     try:
         ls_params = model._get_ls_params()
-    except (AttributeError, TypeError, NotImplementedError):
+    except (AttributeError, TypeError, NotImplementedError) as exc:
+        # INFO rather than DEBUG: a missing or raising `_get_ls_params` causes
+        # profile resolution to silently miss for that model. Custom
+        # integrations need this to be visible at default log levels so users
+        # can debug "my profile isn't applying" without enabling DEBUG.
+        logger.info(
+            "Could not extract provider from %s.%s via _get_ls_params: %s",
+            type(model).__module__,
+            type(model).__name__,
+            exc,
+        )
         return None
     provider = ls_params.get("ls_provider")
     if isinstance(provider, str) and provider:
@@ -123,9 +122,9 @@ def model_matches_spec(model: BaseChatModel, spec: str) -> bool:
     return bool(separator) and model_name == current
 
 
-def _string_value(config: dict[str, Any], key: str) -> str | None:
-    """Return a non-empty string value from a serialized model config."""
-    value = config.get(key)
+def _string_attr(obj: object, attr: str) -> str | None:
+    """Return a non-empty string attribute from `obj`, or `None`."""
+    value = getattr(obj, attr, None)
     if isinstance(value, str) and value:
         return value
     return None

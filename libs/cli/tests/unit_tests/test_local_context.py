@@ -1054,6 +1054,27 @@ class TestSectionGit:
         out = _run_section(_section_git(), tmp_path, with_header=True)
         assert "Current branch `feat-x`" in out
 
+    def test_detached_head_includes_commit_hash(self, tmp_path: Path) -> None:
+        _git_init_commit(tmp_path, branch="main")
+        commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "--detach", "HEAD"],
+            cwd=tmp_path,
+            capture_output=True,
+            check=True,
+        )
+
+        out = _run_section(_section_git(), tmp_path, with_header=True)
+
+        assert f"Detached HEAD at `{commit}`" in out
+        assert "Current branch `HEAD`" not in out
+
     def test_main_branch_listed(self, tmp_path: Path) -> None:
         _git_init_commit(tmp_path, branch="main")
         out = _run_section(_section_git(), tmp_path, with_header=True)
@@ -1388,7 +1409,9 @@ def _make_server(
     name: str, transport: str = "stdio", tool_names: list[str] | None = None
 ) -> MCPServerInfo:
     """Create an MCPServerInfo with the given tool names."""
-    tools = [MCPToolInfo(name=n, description=f"desc-{n}") for n in (tool_names or [])]
+    tools = tuple(
+        MCPToolInfo(name=n, description=f"desc-{n}") for n in (tool_names or [])
+    )
     return MCPServerInfo(name=name, transport=transport, tools=tools)
 
 
