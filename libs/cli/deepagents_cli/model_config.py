@@ -1122,8 +1122,23 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
         try:
             from deepagents._chatgpt_auth import load_tokens  # noqa: PLC2701
         except ImportError:
-            return None
-        return load_tokens() is not None
+            return ProviderAuthStatus(
+                state=ProviderAuthState.UNKNOWN,
+                provider=provider,
+                detail="ChatGPT auth support unavailable",
+            )
+        if load_tokens() is not None:
+            return ProviderAuthStatus(
+                state=ProviderAuthState.CONFIGURED,
+                provider=provider,
+                source=ProviderAuthSource.STORED,
+                detail="ChatGPT login",
+            )
+        return ProviderAuthStatus(
+            state=ProviderAuthState.UNKNOWN,
+            provider=provider,
+            detail="run `deep-agents login openai`",
+        )
 
     # Config-file providers take priority when api_key_env is specified.
     config = ModelConfig.load()

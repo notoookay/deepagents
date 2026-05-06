@@ -7,10 +7,13 @@ persistence to ``~/.deepagents/chatgpt_tokens.json``.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import logging
+import os
 import secrets
+import stat
 import threading
 import time
 import urllib.error
@@ -192,8 +195,43 @@ def load_tokens() -> TokenData | None:
 def save_tokens(tokens: TokenData) -> None:
     """Persist tokens to ``~/.deepagents/chatgpt_tokens.json``."""
     _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _TOKEN_FILE.write_text(json.dumps(dict(tokens), indent=2))
-    _TOKEN_FILE.chmod(0o600)
+    if hasattr(os, "chmod"):
+        try:
+            _TOKEN_FILE.parent.chmod(stat.S_IRWXU)
+        except OSError as exc:
+            logger.warning(
+                "Could not lock down ChatGPT token directory %s (mode 0700): %s. Tokens may be readable by other local users.",
+                _TOKEN_FILE.parent,
+                exc,
+            )
+
+    tmp = _TOKEN_FILE.with_suffix(_TOKEN_FILE.suffix + ".tmp")
+    payload = json.dumps(dict(tokens), separators=(",", ":")).encode("utf-8")
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    try:
+        tmp.replace(_TOKEN_FILE)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    if hasattr(os, "chmod"):
+        try:
+            _TOKEN_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        except OSError as exc:
+            logger.warning(
+                "Could not set mode 0600 on ChatGPT token file %s: %s. Stored refresh/access tokens may be world-readable.",
+                _TOKEN_FILE,
+                exc,
+            )
 
 
 def delete_tokens() -> None:
@@ -319,6 +357,9 @@ def login_browser() -> TokenData:
     try:
         logger.info("Opening browser for ChatGPT authorization...")
         logger.info("If the browser did not open, visit: %s", auth_url)
+        print(  # noqa: T201
+            f"\nOpening browser for ChatGPT authorization.\nIf the browser does not open, visit this URL:\n\n  {auth_url}\n"
+        )
         webbrowser.open(auth_url)
 
         if not done.wait(timeout=_OAUTH_TIMEOUT_SECONDS):
@@ -371,6 +412,9 @@ def login_device() -> TokenData:
     interval_s = max(int(device_resp.get("interval", 5)), 1)
 
     logger.info("Open %s/codex/device in your browser and enter code: %s", ISSUER, user_code)
+    print(  # noqa: T201
+        f"\nOpen this URL in a browser and enter the code below:\n\n  {ISSUER}/codex/device\n\nCode: {user_code}\n"
+    )
 
     while True:
         time.sleep(interval_s + _DEVICE_POLL_SAFETY_MARGIN_SECONDS)
