@@ -771,6 +771,18 @@ def get_available_models() -> dict[str, list[str]]:
                 if model not in existing:
                     available[provider_name].append(model)
 
+    # ChatGPT subscription models are served via a custom BaseChatModel
+    # (deepagents._chatgpt_model.ChatCodex) that bypasses init_chat_model, so
+    # they aren't discovered through the langchain provider registry. Inject
+    # the hand-maintained model list directly so the /model picker sees them.
+    if "chatgpt" not in available and config.is_provider_enabled("chatgpt"):
+        try:
+            from deepagents._chatgpt_model import CHATGPT_MODELS  # noqa: PLC2701
+        except ImportError:
+            logger.debug("deepagents._chatgpt_model not importable; skipping chatgpt")
+        else:
+            available["chatgpt"] = list(CHATGPT_MODELS)
+
     _available_models_cache = available
     return available
 
@@ -1103,6 +1115,16 @@ def get_provider_auth_status(provider: str) -> ProviderAuthStatus:
         Provider auth status for selectors, startup checks, and compatibility
             wrappers.
     """
+    # ChatGPT subscription uses OAuth tokens on disk, not an API key env var.
+    # Check for stored tokens directly so the model picker can distinguish
+    # "logged in" from "not logged in" instead of showing "unknown".
+    if provider == "chatgpt":
+        try:
+            from deepagents._chatgpt_auth import load_tokens  # noqa: PLC2701
+        except ImportError:
+            return None
+        return load_tokens() is not None
+
     # Config-file providers take priority when api_key_env is specified.
     config = ModelConfig.load()
     provider_config = config.providers.get(provider)
