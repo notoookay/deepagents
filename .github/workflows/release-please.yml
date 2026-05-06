@@ -1,6 +1,10 @@
 # Creates release PRs based on conventional commits.
 #
-# When commits land on main, release-please analyzes them and either:
+# This fork does not publish packages, so the workflow is kept for reference
+# but disabled for automatic pushes. Run it manually only if release
+# automation is needed again.
+#
+# When enabled for main pushes, release-please analyzes commits and either:
 # - Creates/updates a release PR with changelog and version bump
 # - When a release PR is merged, triggers the release workflow
 #
@@ -10,9 +14,7 @@
 name: "⚠️ (Automated) Release Please"
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
