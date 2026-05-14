@@ -3910,6 +3910,9 @@ recent = "openai:gpt-5.2"
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch("deepagents_cli.auth_store.get_stored_key", side_effect=stored_key),
+            # `has_chatgpt` reads OAuth tokens from disk; isolate the test
+            # from the developer's real login state.
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = _get_default_model_spec()
