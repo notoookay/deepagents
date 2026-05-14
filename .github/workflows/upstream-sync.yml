@@ -1,0 +1,116 @@
+# Daily upstream sync from langchain-ai/deepagents.
+#
+# Runs every day at 00:00 UTC (and can be triggered manually).
+# If main can be fast-forwarded to upstream, pushes directly to main.
+# If main has diverged, creates/updates a fixed review branch and opens a PR.
+#
+# Required secret:
+# - UPSTREAM_SYNC_TOKEN: fine-grained PAT or GitHub App token with
+#   `contents: write` and `workflows: write` permissions.
+
+name: "🔄 Daily Upstream Sync"
+
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Verify sync token is configured
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        run: |
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::Missing required secret: UPSTREAM_SYNC_TOKEN"
+            echo "::error::Create a token with contents: write and workflows: write, then store it as UPSTREAM_SYNC_TOKEN."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+
+      - name: Sync main with upstream
+        id: sync
+        env:
+          REVIEW_BRANCH: upstream-sync-review
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/langchain-ai/deepagents.git
+          else
+            git remote add upstream https://github.com/langchain-ai/deepagents.git
+          fi
+          git fetch upstream main
+          git fetch origin main
+
+          if git merge-base --is-ancestor origin/main upstream/main; then
+            git checkout -B main origin/main
+            if ! git merge --ff-only upstream/main; then
+              echo "Fast-forward merge failed unexpectedly after ancestor check."
+              exit 1
+            fi
+            git push origin main
+            echo "needs_review=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout -B "$REVIEW_BRANCH" upstream/main
+          remote_sha="$(git ls-remote --heads origin "$REVIEW_BRANCH" | awk '{print $1}')"
+          if [ -n "$remote_sha" ]; then
+            git push --force-with-lease="refs/heads/${REVIEW_BRANCH}:${remote_sha}" origin "$REVIEW_BRANCH"
+          else
+            git push --force-with-lease="refs/heads/${REVIEW_BRANCH}" origin "$REVIEW_BRANCH"
+          fi
+
+          echo "Fast-forward sync failed because origin/main has diverged from upstream/main."
+          echo "Created/updated branch '$REVIEW_BRANCH' for manual review."
+          echo "needs_review=true" >> "$GITHUB_OUTPUT"
+          echo "review_branch=$REVIEW_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open manual review PR when branches diverge
+        if: steps.sync.outputs.needs_review == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const branch = '${{ steps.sync.outputs.review_branch }}';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const { data: existing } = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head: `${owner}:${branch}`,
+              base: 'main',
+            });
+
+            if (existing.length > 0) {
+              core.info(`Manual review PR already exists: #${existing[0].number}`);
+              return;
+            }
+
+            const { data: created } = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: 'Manual review required: upstream sync conflict',
+              head: branch,
+              base: 'main',
+              body: [
+                'Automatic fast-forward sync from `langchain-ai/deepagents` failed because `main` has diverged.',
+                '',
+                'Please review and merge this PR manually to resolve conflicts.',
+              ].join('\n'),
+            });
+
+            core.info(`Created manual review PR: #${created.number}`);
