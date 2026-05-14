@@ -1876,7 +1876,7 @@ def _get_default_model_spec() -> str:
     # implicit-auth provider (e.g., Vertex ADC) is added to this fallback
     # list, switch to checking `state` against the relevant
     # `ProviderAuthState` members directly.
-    if _get_settings().has_chatgpt:
+    if get_provider_auth_status("chatgpt").as_legacy_bool() is True:
         from deepagents._chatgpt_model import DEFAULT_CHATGPT_MODEL  # noqa: PLC2701
 
         return f"chatgpt:{DEFAULT_CHATGPT_MODEL}"
