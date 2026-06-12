@@ -156,6 +156,23 @@ class SlashCommandController:
             self._selected_index = 0
             self._view.clear_completion_suggestions()
 
+    def name_prefix_matches(self, text: str, cursor_index: int) -> list[CommandEntry]:
+        """Return commands whose names start with the current slash query."""
+        if cursor_index < 0 or cursor_index > len(text):
+            return []
+        if not self.can_handle(text, cursor_index):
+            return []
+
+        search = text[1:cursor_index].lower()
+        if not search or " " in search:
+            return []
+
+        return [
+            entry
+            for entry in self._commands
+            if entry.name.lstrip("/").lower().startswith(search)
+        ]
+
     @staticmethod
     def _score_command(search: str, cmd: str, desc: str, keywords: str = "") -> float:
         """Score a command against a search string. Higher = better match.
@@ -301,9 +318,21 @@ class SlashCommandController:
         self.reset()
         return True
 
+    def apply_name_prefix_completion(
+        self, match: CommandEntry, cursor_index: int
+    ) -> None:
+        """Apply a command-name prefix match.
+
+        Args:
+            match: Command entry to apply.
+            cursor_index: Cursor index in completion-space coordinates.
+        """
+        self._view.replace_completion_range(0, cursor_index, match.name)
+        self.reset()
+
 
 # ============================================================================
-# Fuzzy File Completion (from project root)
+# Fuzzy File Completion (scoped to current working directory)
 # ============================================================================
 
 # Constants for fuzzy file completion
@@ -461,8 +490,35 @@ def _fuzzy_search(
     return [c for _, c in scored[:limit]]
 
 
+def _scope_files_to_cwd(files: list[str], project_root: Path, cwd: Path) -> list[str]:
+    """Scope a project-root-relative file list to paths under `cwd`.
+
+    Args:
+        files: File paths relative to `project_root` (as produced by
+            `_get_project_files`).
+        project_root: Directory the `files` paths are relative to.
+        cwd: Directory to scope suggestions to.
+
+    Returns:
+        Paths rewritten relative to `cwd`, filtered to that subtree (possibly
+        empty), when `cwd` is nested under `project_root`. The input list
+        unchanged when `cwd` equals `project_root`. An empty list when `cwd` is
+        not under `project_root`: the paths are project-root-relative and would
+        resolve to the wrong base from `cwd`, so fail closed rather than offer
+        misleading suggestions.
+    """
+    if cwd == project_root:
+        return files
+    try:
+        relative_cwd = cwd.relative_to(project_root).as_posix()
+    except ValueError:
+        return []
+    prefix = f"{relative_cwd}/"
+    return [path[len(prefix) :] for path in files if path.startswith(prefix)]
+
+
 class FuzzyFileController:
-    """Controller for @ file completion with fuzzy matching from project root."""
+    """Controller for @ file completion with fuzzy matching from current cwd."""
 
     def __init__(
         self,
@@ -473,14 +529,19 @@ class FuzzyFileController:
 
         Args:
             view: View to render suggestions to
-            cwd: Starting directory to find project root from
+            cwd: Current working directory for file completion scope
         """
         self._view = view
-        self._cwd = cwd or Path.cwd()
+        self._cwd = (cwd or Path.cwd()).resolve()
         self._project_root = find_project_root(self._cwd) or self._cwd
         self._suggestions: list[tuple[str, str]] = []
         self._selected_index = 0
         self._file_cache: list[str] | None = None
+        # When True, `_project_root` is a provisional value (set synchronously by
+        # `set_cwd`) and the real project root is resolved off the event loop in
+        # `warm_cache`. See `set_cwd` for why discovery is deferred.
+        self._project_root_pending = False
+        self._cache_generation = 0
 
     def _get_files(self) -> list[str]:
         """Get cached file list or refresh.
@@ -489,22 +550,67 @@ class FuzzyFileController:
             List of project file paths.
         """
         if self._file_cache is None:
-            self._file_cache = _get_project_files(self._project_root)
+            files = _get_project_files(self._project_root)
+            self._file_cache = _scope_files_to_cwd(files, self._project_root, self._cwd)
         return self._file_cache
 
     def refresh_cache(self) -> None:
         """Force refresh of file cache."""
+        self._cache_generation += 1
         self._file_cache = None
 
+    def set_cwd(self, cwd: Path) -> None:
+        """Switch completion roots to a new cwd.
+
+        Roots completion at `cwd` immediately and invalidates the file cache.
+        Project-root discovery (`find_project_root`) walks the filesystem, so it
+        is deferred to `warm_cache` (which runs in a worker thread) rather than
+        run here on the event loop. Until then `cwd` is used as a provisional
+        root, which is a safe narrower scope.
+        """
+        self._cache_generation += 1
+        self._cwd = cwd.resolve()
+        self._project_root = self._cwd
+        self._project_root_pending = True
+        self._file_cache = None
+        self.reset()
+
     async def warm_cache(self) -> None:
-        """Pre-populate the file cache off the event loop."""
+        """Pre-populate the file cache off the event loop.
+
+        Also resolves a project root deferred by `set_cwd`, so the blocking
+        filesystem walk runs in a worker thread instead of on the event loop.
+
+        Warmers are scheduled non-exclusively, so quick cwd/cache invalidations
+        can run concurrently. The generation is snapshotted once before the first
+        await and re-checked after each await, so a warmer whose generation has
+        been superseded drops its results instead of overwriting controller state
+        belonging to a newer generation. (Snapshotting again before the second
+        await would defeat the guard: it would match the post-supersession
+        generation and let a stale-root file walk win.)
+        """
+        cwd = self._cwd
+        generation = self._cache_generation
+        if self._project_root_pending:
+            root = await asyncio.to_thread(find_project_root, cwd)
+            if generation != self._cache_generation:
+                # A newer cwd/cache invalidation superseded this warmer.
+                return
+            resolved = root or cwd
+            if resolved != self._project_root:
+                # The real root differs from the provisional `cwd`; drop any
+                # cache built against the narrower scope.
+                self._file_cache = None
+            self._project_root = resolved
+            self._project_root_pending = False
         if self._file_cache is not None:
             return
+        project_root = self._project_root
         # Best-effort; _get_files() falls back to sync on failure.
         with contextlib.suppress(Exception):
-            self._file_cache = await asyncio.to_thread(
-                _get_project_files, self._project_root
-            )
+            files = await asyncio.to_thread(_get_project_files, project_root)
+            if generation == self._cache_generation:
+                self._file_cache = _scope_files_to_cwd(files, project_root, cwd)
 
     @staticmethod
     def can_handle(text: str, cursor_index: int) -> bool:

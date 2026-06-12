@@ -6,10 +6,14 @@ import importlib
 import os
 import sys
 from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from deepagents_code._env_vars import SERVER_ENV_PREFIX
 from deepagents_code._server_config import ServerConfig
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _import_fresh_server_graph() -> ModuleType:
@@ -34,6 +38,7 @@ class TestServerGraph:
         graph_obj = object()
         model_obj = object()
         fetch_tool = object()
+        thread_tool = object()
         mcp_tool = object()
         mcp_server_info = [SimpleNamespace(name="docs")]
         create_cli_agent = MagicMock(return_value=(graph_obj, object()))
@@ -60,6 +65,7 @@ class TestServerGraph:
         tools_module = _module_with_attrs(
             "deepagents_code.tools",
             fetch_url=fetch_tool,
+            get_current_thread_id=thread_tool,
             web_search=object(),
         )
 
@@ -119,7 +125,7 @@ class TestServerGraph:
         create_cli_agent.assert_called_once_with(
             model=model_obj,
             assistant_id="agent",
-            tools=[fetch_tool, mcp_tool],
+            tools=[fetch_tool, thread_tool, mcp_tool],
             sandbox=None,
             sandbox_type=None,
             system_prompt=None,
@@ -131,9 +137,63 @@ class TestServerGraph:
             enable_memory=True,
             enable_skills=True,
             enable_shell=True,
+            enable_interpreter=False,
             mcp_server_info=mcp_server_info,
             cwd=None,
             project_context=None,
             async_subagents=None,
         )
         assert module.graph is graph_obj
+
+
+class TestStartupErrorMarker:
+    """`emit_startup_failure` must produce the parser marker on stderr.
+
+    The marker is the contract `wait_for_server_healthy` parses to surface
+    a one-line summary instead of "Server process exited with code N".
+    """
+
+    def test_emits_marker_with_type_and_summary(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from deepagents_code._startup_error import (
+            STARTUP_ERROR_MARKER,
+            emit_startup_failure,
+        )
+
+        emit_startup_failure(ValueError("boom: details"))
+        captured = capsys.readouterr()
+        assert f"{STARTUP_ERROR_MARKER}ValueError: boom: details" in captured.err
+        assert "Failed to initialize server graph: boom: details" in captured.err
+
+    def test_marker_collapses_multiline_exception(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from deepagents_code._startup_error import (
+            STARTUP_ERROR_MARKER,
+            emit_startup_failure,
+        )
+
+        emit_startup_failure(ValueError("first line\nsecond line"))
+        captured = capsys.readouterr()
+        marker_line = next(
+            line
+            for line in captured.err.splitlines()
+            if line.startswith(STARTUP_ERROR_MARKER)
+        )
+        assert marker_line == f"{STARTUP_ERROR_MARKER}ValueError: first line"
+
+    def test_marker_handles_empty_exception_message(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from deepagents_code._startup_error import (
+            STARTUP_ERROR_MARKER,
+            emit_startup_failure,
+        )
+
+        emit_startup_failure(RuntimeError())
+        captured = capsys.readouterr()
+        assert f"{STARTUP_ERROR_MARKER}RuntimeError: <no message>" in captured.err

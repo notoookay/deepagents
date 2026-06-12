@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sys
 import time
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -209,6 +210,10 @@ class TestTokenPersistence:
         with patch("deepagents._chatgpt_auth._TOKEN_FILE", token_file):
             delete_tokens()  # should not raise
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX permission bits are not enforced on Windows",
+    )
     def test_save_sets_mode_600(self, tmp_path: Path) -> None:
         token_file = tmp_path / "chatgpt_tokens.json"
         tokens = _make_token_data()
@@ -218,6 +223,10 @@ class TestTokenPersistence:
         assert mode == 0o600
         assert not token_file.with_suffix(".json.tmp").exists()
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX permission bits are not enforced on Windows",
+    )
     def test_save_locks_down_parent_directory(self, tmp_path: Path) -> None:
         token_file = tmp_path / "chatgpt_tokens.json"
         tokens = _make_token_data()

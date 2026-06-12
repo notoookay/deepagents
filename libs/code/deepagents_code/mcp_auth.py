@@ -11,26 +11,43 @@ server X") rather than the token itself.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import hashlib
+import html
 import json
 import logging
 import os
 import re
+import secrets
 import stat
-from collections.abc import Awaitable, Callable
+import threading
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import TYPE_CHECKING, Literal, TypedDict
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from mcp.client.auth import OAuthClientProvider, TokenStorage
+from mcp.client.auth.utils import (
+    build_oauth_authorization_server_metadata_discovery_urls,
+    build_protected_resource_metadata_discovery_urls,
+    create_oauth_metadata_request,
+    handle_auth_metadata_response,
+    handle_protected_resource_response,
+)
+from mcp.client.streamable_http import MCP_PROTOCOL_VERSION
 from mcp.shared.auth import (
     OAuthClientInformationFull,
+    OAuthMetadata,
     OAuthToken,
 )
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from deepagents_code.mcp_oauth_ui import OAuthInteraction
 
 
 class _DeviceCodeResponse(BaseModel):
@@ -104,6 +121,14 @@ risking a circular import. Keep both regexes in sync."""
 _STORAGE_VERSION = 1
 """Schema version stamped into persisted credential files; bump on incompatible
 shape changes so `_load_*` can reject or migrate older payloads."""
+
+_REFRESH_SAFETY_MARGIN_SECONDS = 30.0
+"""Refresh access tokens this many seconds before their advertised expiry.
+
+Absorbs clock skew and request latency so a token deemed valid locally isn't
+rejected as expired by the server — without the margin, a 401 sends the SDK
+into the full re-auth (browser) flow instead of the cheaper refresh grant.
+"""
 
 
 def resolve_headers(
@@ -228,10 +253,20 @@ class FileTokenStorage(TokenStorage):
         return OAuthToken.model_validate(raw)
 
     async def set_tokens(self, tokens: OAuthToken) -> None:
-        """Persist `tokens` to disk, preserving any stored client info."""
+        """Persist `tokens` to disk, preserving any stored client info.
+
+        Also records the absolute Unix-epoch expiry as a sidecar so a
+        cold-started provider can detect a stale access token and trigger
+        the SDK's `refresh_token` grant instead of a full browser re-auth.
+        Cleared when `expires_in` is absent so the sidecar can't go stale.
+        """
         data = self._read() or {}
         data["version"] = _STORAGE_VERSION
         data["tokens"] = json.loads(tokens.model_dump_json(exclude_none=True))
+        if tokens.expires_in is not None:
+            data["expires_at"] = time.time() + tokens.expires_in
+        else:
+            data.pop("expires_at", None)
         self._write(data)
 
     async def get_client_info(self) -> OAuthClientInformationFull | None:
@@ -251,6 +286,23 @@ class FileTokenStorage(TokenStorage):
         data["client_info"] = json.loads(client_info.model_dump_json(exclude_none=True))
         self._write(data)
 
+    async def get_oauth_metadata(self) -> OAuthMetadata | None:
+        """Return stored public OAuth authorization metadata, if available."""
+        data = self._read()
+        if data is None:
+            return None
+        raw = data.get("oauth_metadata")
+        if raw is None:
+            return None
+        return OAuthMetadata.model_validate(raw)
+
+    async def set_oauth_metadata(self, metadata: OAuthMetadata) -> None:
+        """Persist public OAuth authorization metadata beside the token state."""
+        data = self._read() or {}
+        data["version"] = _STORAGE_VERSION
+        data["oauth_metadata"] = json.loads(metadata.model_dump_json(exclude_none=True))
+        self._write(data)
+
     async def set_tokens_and_client_info(
         self,
         tokens: OAuthToken,
@@ -265,7 +317,174 @@ class FileTokenStorage(TokenStorage):
         data["version"] = _STORAGE_VERSION
         data["tokens"] = json.loads(tokens.model_dump_json(exclude_none=True))
         data["client_info"] = json.loads(client_info.model_dump_json(exclude_none=True))
+        if tokens.expires_in is not None:
+            data["expires_at"] = time.time() + tokens.expires_in
+        else:
+            data.pop("expires_at", None)
         self._write(data)
+
+    async def get_expires_at(self) -> float | None:
+        """Return the stored absolute token expiry (Unix epoch), or `None`.
+
+        Returns `None` for token files written before this field existed,
+        for tokens whose provider omitted `expires_in`, or when the sidecar
+        value fails to coerce to `float`. Callers should treat `None` as
+        "expiry unknown" and decide policy (skip, assume-expired, etc.).
+        """
+        data = self._read()
+        if data is None:
+            return None
+        raw = data.get("expires_at")
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            # Log the value's type, never the value itself — the sidecar lives
+            # next to the bearer token in the same JSON envelope, so a
+            # misplaced token string would land here.
+            logger.warning(
+                "MCP token sidecar 'expires_at' for %s is not numeric (%s); "
+                "treating as unknown. The next request will trigger a refresh "
+                "or browser re-auth.",
+                self._server_name,
+                type(raw).__name__,
+            )
+            return None
+
+    def stored_loopback_port(self) -> int | None:
+        """Return the stored loopback redirect URI port, if one is reusable.
+
+        DCR registers `client_id` against a specific `redirect_uri`. If the
+        callback server binds a fresh random port on a later launch, the
+        authorize request will carry a `redirect_uri` that no longer matches
+        the one registered with the persisted `client_id`, and the
+        authorization server will reject it ("invalid or missing redirect_uri").
+        Reusing the persisted port keeps the registration valid across runs.
+
+        Returns:
+            The integer port parsed from a stored
+                `http://localhost:<port>/callback` redirect URI, or `None` if
+                no usable port is on disk.
+        """
+        try:
+            data = self._read()
+        except RuntimeError as exc:
+            logger.warning(
+                "MCP token file for %s is unreadable during loopback port "
+                "lookup; falling back to a fresh random port. Delete the file "
+                "and log in again if OAuth authorization fails: %s",
+                self.path,
+                exc,
+            )
+            return None
+        if data is None:
+            return None
+        client_info = data.get("client_info") or {}
+        redirect_uris = client_info.get("redirect_uris") or []
+        if not redirect_uris:
+            return None
+        uri = str(redirect_uris[0])
+        port = self._loopback_callback_port(uri)
+        if port is None:
+            logger.warning(
+                "Stored MCP OAuth redirect URI for %s is not a reusable "
+                "loopback callback URI; falling back to a fresh random port. "
+                "OAuth authorization may fail if the server requires the "
+                "persisted client registration redirect URI: %s",
+                self.path,
+                uri,
+            )
+            return None
+        return port
+
+    @staticmethod
+    def _loopback_callback_port(uri: str) -> int | None:
+        """Return `uri`'s port if it is a reusable loopback callback URI.
+
+        A reusable URI is `http://localhost:<port>/callback` with an explicit
+        port. Anything else (a different scheme/host/path, or a portless
+        `http://localhost/callback`) returns `None` because it cannot be paired
+        with the loopback callback server a CLI login binds.
+        """
+        parsed = urlparse(uri)
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname != _LOOPBACK_URI_HOST
+            or parsed.path != _LOOPBACK_CALLBACK_PATH
+            or port is None
+        ):
+            return None
+        return port
+
+    def discard_client_info_if_loopback_unusable(self) -> bool:
+        """Drop a persisted client registration that can't serve loopback login.
+
+        `stored_loopback_port` explains why the authorize request's
+        `redirect_uri` must match the one registered against the persisted
+        `client_id`. When that registered URI is not a reusable loopback
+        callback (e.g. a portless `http://localhost/callback` left by an earlier
+        non-loopback login), no port can be reused, so a CLI login binds a fresh
+        random port and the server rejects the mismatched `redirect_uri`
+        ("invalid or missing redirect_uri"). Removing the stale `client_info`
+        makes the SDK perform a fresh DCR with the loopback redirect URI it will
+        actually use.
+
+        Only discards when no token is persisted at all, so a session with a
+        usable (or refreshable) token is never downgraded to a full re-auth.
+        The presence check is deliberately conservative: it errs toward keeping
+        the registration, never toward deleting one that might still be needed.
+
+        Returns:
+            `True` if a stale client registration was removed. `False` covers
+                both "nothing to discard" and "could not discard" (an
+                unreadable or unwritable token file, logged where it happens).
+        """
+        try:
+            data = self._read()
+        except RuntimeError as exc:
+            # Mirror `stored_loopback_port`: a corrupt or unsupported-version
+            # token file carries actionable "delete the file" guidance in the
+            # `RuntimeError` message, so surface it rather than dropping it.
+            logger.warning(
+                "MCP token file for %s is unreadable while checking for a "
+                "stale client registration; skipping self-heal. Delete the "
+                "file and log in again if OAuth authorization fails: %s",
+                self.path,
+                exc,
+            )
+            return False
+        if data is None or "client_info" not in data:
+            return False
+        # A persisted access/refresh token can still authenticate (or refresh)
+        # without re-running the authorization-code grant, so leave the
+        # registration intact rather than forcing an avoidable re-auth.
+        if data.get("tokens") is not None:
+            return False
+        redirect_uris = (data.get("client_info") or {}).get("redirect_uris") or []
+        if (
+            redirect_uris
+            and self._loopback_callback_port(str(redirect_uris[0])) is not None
+        ):
+            return False
+        del data["client_info"]
+        try:
+            self._write(data)
+        except OSError as exc:
+            # Surface the failure but don't crash login: the stale registration
+            # simply remains, and the login attempt fails the same way it would
+            # have without this self-heal.
+            logger.warning(
+                "Could not remove stale MCP client registration in %s: %s",
+                self.path,
+                exc,
+            )
+            return False
+        return True
 
     def _read(self) -> dict | None:
         path = self.path
@@ -277,16 +496,16 @@ class FileTokenStorage(TokenStorage):
         except (OSError, json.JSONDecodeError) as exc:
             msg = (
                 f"Failed to read MCP token file {path}: {exc}. "
-                "Delete the file and re-run `deepagents mcp login "
-                f"{self._server_name}` if it is corrupt."
+                f"Delete the file and run `/mcp login {self._server_name}` "
+                f"in the TUI (or `dcode mcp login {self._server_name}`)."
             )
             raise RuntimeError(msg) from exc
         if data.get("version") != _STORAGE_VERSION:
             msg = (
                 f"MCP token file {path} has unsupported version "
                 f"{data.get('version')!r} (expected {_STORAGE_VERSION}). "
-                "Delete it and re-run `deepagents mcp login "
-                f"{self._server_name}`."
+                f"Delete it and run `/mcp login {self._server_name}` in the "
+                f"TUI (or `dcode mcp login {self._server_name}`)."
             )
             raise RuntimeError(msg)
         return data
@@ -346,6 +565,288 @@ class FileTokenStorage(TokenStorage):
 
 RedirectHandler = Callable[[str], Awaitable[None]]
 CallbackHandler = Callable[[], Awaitable[tuple[str, str | None]]]
+_LOOPBACK_BIND_HOST = "127.0.0.1"
+_LOOPBACK_URI_HOST = "localhost"
+_LOOPBACK_CALLBACK_PATH = "/callback"
+_LOOPBACK_CALLBACK_TIMEOUT = 300.0
+
+
+class _LoopbackCallbackTimeoutError(RuntimeError):
+    """Raised when the browser never reaches the local callback server."""
+
+
+class _LoopbackCallbackUnavailableError(RuntimeError):
+    """Raised when the local callback server cannot be started."""
+
+
+def _choose_loopback_port() -> int:
+    """Return a high local TCP port candidate without opening a socket.
+
+    The OAuth redirect URI must be known before the provider starts the
+    handshake, but the actual callback server should not keep a socket open
+    unless a browser redirect is needed.
+
+    Returns:
+        A port number from the dynamic/private port range.
+    """
+    return 49152 + secrets.randbelow(65535 - 49152 + 1)
+
+
+class _LoopbackOAuthCallbackServer:
+    """Single-use loopback HTTP server for CLI OAuth callbacks.
+
+    Port selection and socket binding are intentionally separated: the
+    redirect URI is fixed at construction time so it can be registered with
+    the OAuth provider, while the socket is not opened until `start()` is
+    called from the redirect handler.
+    """
+
+    def __init__(self, *, port: int) -> None:
+        """Prepare a callback server for a previously selected loopback port.
+
+        Args:
+            port: TCP port to bind when `start()` is called.
+        """
+        self._port = port
+        self.redirect_uri = (
+            f"http://{_LOOPBACK_URI_HOST}:{port}{_LOOPBACK_CALLBACK_PATH}"
+        )
+        self._future: concurrent.futures.Future[tuple[str, str | None]] = (
+            concurrent.futures.Future()
+        )
+        self._server: object | None = None
+        self._started = False
+        self._closed = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def port(self) -> int:
+        """Loopback TCP port this server will bind on `start()`."""
+        return self._port
+
+    def start(self) -> None:
+        """Bind and start serving callback requests in a background thread."""
+        if self._started:
+            return
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        parent = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                parent._handle_get(self)
+
+            def log_message(  # noqa: PLR6301  # stdlib override
+                self,
+                format: str,  # noqa: A002
+                *args: object,
+            ) -> None:
+                del format, args
+
+        self._server = ThreadingHTTPServer((_LOOPBACK_BIND_HOST, self._port), Handler)
+        self._started = True
+        self._thread = threading.Thread(
+            target=self._serve_forever,
+            name="deepagents-mcp-oauth-callback",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _serve_forever(self) -> None:
+        from http.server import ThreadingHTTPServer
+
+        if isinstance(self._server, ThreadingHTTPServer):
+            self._server.serve_forever()
+
+    async def wait(self) -> tuple[str, str | None]:
+        """Wait for the authorization callback and return `(code, state)`.
+
+        Returns:
+            The OAuth authorization code and optional state.
+
+        Raises:
+            _LoopbackCallbackTimeoutError: If no callback arrives before the timeout.
+            _LoopbackCallbackUnavailableError: If the server could not be started.
+            RuntimeError: If the provider returned an OAuth error or the callback
+                URL lacked a `code` parameter.
+        """  # noqa: DOC502 - _LoopbackCallbackUnavailableError/RuntimeError set on future
+        import asyncio
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(self._future),
+                timeout=_LOOPBACK_CALLBACK_TIMEOUT,
+            )
+        except TimeoutError as exc:
+            msg = "Browser callback was not received before the timeout."
+            raise _LoopbackCallbackTimeoutError(msg) from exc
+
+    def fail(self, exc: Exception) -> None:
+        """Poison the future so `wait()` raises `exc` immediately.
+
+        Args:
+            exc: Exception to surface to the awaiting coroutine.
+        """
+        if not self._future.done():
+            self._future.set_exception(exc)
+
+    def close(self) -> None:
+        """Stop the local callback server and release its socket."""
+        if self._closed:
+            return
+        self._closed = True
+        from http.server import ThreadingHTTPServer
+
+        if isinstance(self._server, ThreadingHTTPServer):
+            if self._started:
+                self._server.shutdown()
+            self._server.server_close()
+
+    def _handle_get(self, request: object) -> None:
+        from http.server import BaseHTTPRequestHandler
+
+        handler = request
+        if not isinstance(handler, BaseHTTPRequestHandler):
+            return
+
+        if self._future.done():
+            # Duplicate browser request (retry, prefetch, favicon) after the
+            # flow already completed. Respond and return without touching the
+            # future — avoids InvalidStateError from a concurrent set_result.
+            # Branch on the future's terminal state: a previous error must
+            # not be papered over with a success page.
+            if self._future.exception() is None:
+                self._send_html(
+                    handler,
+                    200,
+                    _oauth_success_html(
+                        "MCP authorization complete. "
+                        "This tab will close automatically.",
+                    ),
+                )
+            else:
+                self._send_html(
+                    handler,
+                    400,
+                    _oauth_error_html(
+                        "Authorization did not complete. "
+                        "Return to your terminal for details.",
+                    ),
+                )
+            return
+
+        parsed = urlparse(handler.path)
+        if parsed.path != _LOOPBACK_CALLBACK_PATH:
+            self._send_html(
+                handler,
+                404,
+                _oauth_error_html("Callback route not found."),
+            )
+            return
+
+        params = parse_qs(parsed.query)
+        if "error" in params:
+            err_code = params["error"][0]
+            err_desc = (params.get("error_description") or [""])[0]
+            detail = f": {err_desc}" if err_desc else ""
+            msg = f"Authorization denied by provider: {err_code}{detail}"
+            self._future.set_exception(RuntimeError(msg))
+            self._send_html(handler, 400, _oauth_error_html(msg))
+            return
+
+        if "code" not in params or not params["code"]:
+            msg = "Callback URL is missing the 'code' parameter."
+            self._future.set_exception(RuntimeError(msg))
+            self._send_html(handler, 400, _oauth_error_html(msg))
+            return
+
+        self._future.set_result((params["code"][0], (params.get("state") or [None])[0]))
+        self._send_html(
+            handler,
+            200,
+            _oauth_success_html(
+                "MCP authorization complete. This tab will close automatically.",
+            ),
+        )
+
+    @staticmethod
+    def _send_html(handler: object, status: int, body: str) -> None:
+        from http.server import BaseHTTPRequestHandler
+
+        if not isinstance(handler, BaseHTTPRequestHandler):
+            return
+        payload = body.encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+
+def _oauth_success_html(message: str) -> str:
+    return _oauth_result_html(
+        title="Authorization complete",
+        heading="You're signed in",
+        message=message,
+        status="success",
+    )
+
+
+def _oauth_error_html(message: str) -> str:
+    return _oauth_result_html(
+        title="Authorization failed",
+        heading="Authorization failed",
+        message=message,
+        status="error",
+    )
+
+
+def _oauth_result_html(
+    *,
+    title: str,
+    heading: str,
+    message: str,
+    status: Literal["success", "error"],
+) -> str:
+    accent = "#137333" if status == "success" else "#b3261e"
+    background = "#eef7f0" if status == "success" else "#fceeee"
+    mark = "✓" if status == "success" else "!"
+    escaped_title = html.escape(title)
+    escaped_heading = html.escape(heading)
+    escaped = html.escape(message)
+    # `window.close()` is only honored for tabs the script itself opened
+    # (browser policy), but for the common case where the auth flow was
+    # launched via `window.open` / `target=_blank` from another page, the
+    # tab closes cleanly. When the browser refuses, the user still sees the
+    # static success page and the message text remains accurate.
+    auto_close = (
+        "<script>setTimeout(function(){window.close();},2000);</script>"
+        if status == "success"
+        else ""
+    )
+    return (
+        '<!doctype html><html><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>{escaped_title}</title>"
+        "<style>"
+        "body{margin:0;min-height:100vh;display:grid;place-items:center;"
+        "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+        "background:#f8faf9;color:#1f2328}"
+        ".panel{width:min(480px,calc(100vw - 40px));box-sizing:border-box;"
+        "padding:32px;border:1px solid #d8dee4;border-radius:8px;"
+        "background:#fff;box-shadow:0 18px 45px rgba(31,35,40,.08)}"
+        ".mark{width:44px;height:44px;border-radius:50%;display:grid;"
+        "place-items:center;margin-bottom:20px;font-weight:700}"
+        "h1{font-size:24px;line-height:1.2;margin:0 0 10px}"
+        "p{font-size:15px;line-height:1.5;margin:0;color:#57606a}"
+        "</style></head><body>"
+        '<main class="panel">'
+        f'<div class="mark" style="background:{background};color:{accent}">{mark}</div>'
+        f"<h1>{escaped_heading}</h1><p>{escaped}</p>"
+        "</main>"
+        f"{auto_close}"
+        "</body></html>"
+    )
 
 
 class MCPReauthRequiredError(RuntimeError):
@@ -356,7 +857,8 @@ class MCPReauthRequiredError(RuntimeError):
         self.server_name = server_name
         super().__init__(
             f"MCP server {server_name!r} needs re-authentication. "
-            f"Run: deepagents mcp login {server_name}"
+            f"Run `/mcp login {server_name}` in the TUI, or "
+            f"`dcode mcp login {server_name}` from the shell.",
         )
 
 
@@ -379,49 +881,156 @@ def _make_reauth_required_handlers(
 
 
 def _make_paste_back_handlers(
-    *, extra_auth_params: dict[str, str] | None = None
+    *,
+    extra_auth_params: dict[str, str] | None = None,
+    ui: OAuthInteraction | None = None,
 ) -> tuple[RedirectHandler, CallbackHandler]:
     """Create paste-back redirect and callback handlers for OAuth.
 
     Args:
         extra_auth_params: Extra query params to append to the auth URL.
+        ui: Interaction surface for the auth URL display and the
+            pasted-back callback URL prompt.
 
     Returns:
         A tuple of `(redirect_handler, callback_handler)`.
     """
     extras = dict(extra_auth_params or {})
+    interaction = ui if ui is not None else _default_ui()
 
-    async def redirect(auth_url: str) -> None:  # noqa: RUF029
+    async def redirect(auth_url: str) -> None:
         final_url = _append_query_params(auth_url, extras) if extras else auth_url
-        print(  # noqa: T201 - intentional user-facing prompt
-            "\nOpen this URL in a browser, approve access, then paste the full "
-            "callback URL back here:\n"
-            f"\n  {final_url}\n"
-        )
+        await interaction.show_authorize_url(final_url, opened_in_browser=False)
 
     async def callback() -> tuple[str, str | None]:
-        import asyncio
+        url = await interaction.request_callback_url()
+        return _parse_callback_url(url)
 
+    return redirect, callback
+
+
+def _parse_callback_url(url: str) -> tuple[str, str | None]:
+    """Parse a provider callback URL into `(code, state)`.
+
+    Args:
+        url: Raw callback URL pasted by the user.
+
+    Returns:
+        The `code` and optional `state` query parameters.
+
+    Raises:
+        RuntimeError: If the URL contains `error=` or lacks `code`.
+    """
+    params = parse_qs(urlparse(url).query)
+    if "error" in params:
+        err_code = params["error"][0]
+        err_desc = (params.get("error_description") or [""])[0]
+        detail = f": {err_desc}" if err_desc else ""
+        msg = f"Authorization denied by provider: {err_code}{detail}"
+        raise RuntimeError(msg)
+    if "code" not in params or not params["code"]:
+        msg = "Callback URL is missing the 'code' parameter."
+        raise RuntimeError(msg)
+    return params["code"][0], (params.get("state") or [None])[0]
+
+
+def _default_ui() -> OAuthInteraction:
+    """Return the default `OAuthInteraction` implementation (CLI stdio)."""
+    from deepagents_code.mcp_oauth_ui import CliOAuthInteraction
+
+    return CliOAuthInteraction()
+
+
+def _make_loopback_handlers(
+    *,
+    callback_server: _LoopbackOAuthCallbackServer,
+    extra_auth_params: dict[str, str] | None = None,
+    ui: OAuthInteraction | None = None,
+) -> tuple[RedirectHandler, CallbackHandler]:
+    """Create browser loopback redirect and callback handlers for OAuth.
+
+    Args:
+        callback_server: Prepared local callback server for this login attempt.
+            The socket is bound when the returned redirect handler is first called.
+        extra_auth_params: Extra query params to append to the auth URL.
+        ui: Interaction surface for the browser-opened or fallback prompts.
+
+    Returns:
+        A tuple of `(redirect_handler, callback_handler)`.
+    """
+    extras = dict(extra_auth_params or {})
+    interaction = ui if ui is not None else _default_ui()
+    last_authorize_url: str | None = None
+    _paste_redirect, paste_callback = _make_paste_back_handlers(
+        extra_auth_params=extra_auth_params,
+        ui=interaction,
+    )
+
+    async def redirect(auth_url: str) -> None:
+        import asyncio
+        import webbrowser
+
+        nonlocal last_authorize_url
+        final_url = _append_query_params(auth_url, extras) if extras else auth_url
+        last_authorize_url = final_url
+
+        # Resolve a browser explicitly before opening so headless / SSH
+        # environments fall through to paste-back without burning the
+        # 300s loopback timeout. `webbrowser.open` can return `True` in
+        # those environments even when nothing launches.
         try:
-            raw = await asyncio.to_thread(input, "Callback URL: ")
-        except EOFError as exc:
-            msg = (
-                "No callback URL received (stdin closed). "
-                "Re-run `deepagents mcp login <server>` and paste the URL."
+            await asyncio.to_thread(webbrowser.get)
+            has_browser = True
+        except webbrowser.Error:
+            has_browser = False
+
+        if has_browser:
+            opened = await asyncio.to_thread(webbrowser.open, final_url)
+        else:
+            opened = False
+        if not opened:
+            callback_server.fail(
+                _LoopbackCallbackUnavailableError(
+                    "No browser is available to complete the OAuth flow.",
+                ),
             )
-            raise RuntimeError(msg) from exc
-        url = raw.strip()
-        params = parse_qs(urlparse(url).query)
-        if "error" in params:
-            err_code = params["error"][0]
-            err_desc = (params.get("error_description") or [""])[0]
-            detail = f": {err_desc}" if err_desc else ""
-            msg = f"Authorization denied by provider: {err_code}{detail}"
-            raise RuntimeError(msg)
-        if "code" not in params or not params["code"]:
-            msg = "Callback URL is missing the 'code' parameter."
-            raise RuntimeError(msg)
-        return params["code"][0], (params.get("state") or [None])[0]
+            await interaction.show_authorize_url(final_url, opened_in_browser=False)
+            return
+        try:
+            callback_server.start()
+        except OSError as exc:
+            logger.warning(
+                "Could not start loopback OAuth callback server on port %s: %s",
+                callback_server.port,
+                exc,
+            )
+            msg = "Local OAuth callback server could not be started."
+            callback_server.fail(_LoopbackCallbackUnavailableError(msg))
+            await interaction.show_notice(
+                "Could not start the local OAuth callback server.",
+            )
+            await interaction.show_authorize_url(final_url, opened_in_browser=False)
+            return
+        await interaction.show_authorize_url(final_url, opened_in_browser=True)
+
+    async def callback() -> tuple[str, str | None]:
+        try:
+            return await callback_server.wait()
+        except (
+            _LoopbackCallbackTimeoutError,
+            _LoopbackCallbackUnavailableError,
+        ) as exc:
+            if last_authorize_url is not None:
+                await interaction.show_authorize_url(
+                    last_authorize_url,
+                    opened_in_browser=False,
+                )
+            await interaction.show_notice(
+                f"{exc}\nPaste the full callback URL instead.",
+            )
+            return await paste_callback()
+        finally:
+            callback_server.close()
 
     return redirect, callback
 
@@ -437,6 +1046,184 @@ def _append_query_params(url: str, params: dict[str, str]) -> str:
     return urlunparse(parsed._replace(query=urlencode(existing, doseq=True)))
 
 
+class _ExpiryAwareOAuthClientProvider(OAuthClientProvider):
+    """`OAuthClientProvider` that restores `token_expiry_time` from storage.
+
+    Upstream `_initialize` loads stored tokens but leaves
+    `context.token_expiry_time` at `None`, which makes `is_token_valid`
+    report any stored access token — even one that expired hours ago —
+    as valid. The SDK then sends a stale `Bearer`, gets a 401, and falls
+    into a full re-auth (browser) instead of the `refresh_token` grant.
+
+    Restoring the persisted absolute expiry to the context after load
+    lets the SDK's refresh-when-invalid-and-refreshable branch fire on
+    the first request after a cold start. When the sidecar is absent
+    (older token files written before this field existed), assume the
+    token is expired so the refresh path still gets a chance before
+    falling back to 401.
+    """
+
+    async def _initialize(self) -> None:
+        # Overrides a leading-underscore SDK method; behavior depends on
+        # `super()._initialize()` populating `context.current_tokens` from
+        # storage. If an upstream rename or refactor breaks that contract,
+        # the test suite's TestExpiryAwareOAuthClientProvider cases will
+        # fail loudly rather than silently regress to the 401-on-restart
+        # bug this class exists to prevent.
+        await super()._initialize()
+        if self.context.oauth_metadata is None:
+            get_oauth_metadata = getattr(
+                self.context.storage,
+                "get_oauth_metadata",
+                None,
+            )
+            if get_oauth_metadata is not None:
+                self.context.oauth_metadata = await get_oauth_metadata()
+        get_expires_at = getattr(self.context.storage, "get_expires_at", None)
+        if get_expires_at is None:
+            return
+        expires_at = await get_expires_at()
+        tokens = self.context.current_tokens
+        if expires_at is None:
+            # Use 1.0 (one second after the Unix epoch) rather than 0.0 so the
+            # SDK's `not self.token_expiry_time` falsy-zero check doesn't treat
+            # the sentinel as "no expiry known" and mark the token valid again.
+            if tokens is not None and tokens.refresh_token:
+                self.context.token_expiry_time = 1.0
+            elif tokens is not None and tokens.access_token:
+                # Legacy file with no refresh_token: nothing we can do to
+                # pre-empt expiry. Surface a structural breadcrumb so the
+                # 401-then-browser-reauth flow isn't completely silent.
+                logger.info(
+                    "Legacy MCP token file for %s has no refresh_token; "
+                    "cannot pre-empt expiry. The next 401 will trigger "
+                    "browser re-auth.",
+                    self.context.server_url,
+                )
+            return
+        if expires_at - time.time() < _REFRESH_SAFETY_MARGIN_SECONDS:
+            # Token already inside its safety margin (or past it) — likely a
+            # cold start after a long pause, or a misconfigured server issuing
+            # sub-margin lifetimes. Log only the duration, never any token
+            # material.
+            logger.debug(
+                "MCP token for %s is within %.0fs of expiry on load; "
+                "scheduling refresh on next request.",
+                self.context.server_url,
+                _REFRESH_SAFETY_MARGIN_SECONDS,
+            )
+        self.context.token_expiry_time = expires_at - _REFRESH_SAFETY_MARGIN_SECONDS
+
+    async def _persist_oauth_metadata(self) -> None:
+        """Persist discovered public OAuth metadata when storage supports it."""
+        if self.context.oauth_metadata is None:
+            return
+        set_oauth_metadata = getattr(self.context.storage, "set_oauth_metadata", None)
+        if set_oauth_metadata is not None:
+            await set_oauth_metadata(self.context.oauth_metadata)
+
+    async def _handle_token_response(self, response: httpx.Response) -> None:
+        """Persist tokens and any metadata discovered during full OAuth login."""
+        await super()._handle_token_response(response)
+        await self._persist_oauth_metadata()
+
+    async def async_auth_flow(
+        self,
+        request: httpx.Request,
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Discover and cache OAuth metadata before the SDK refresh branch.
+
+        Yields:
+            HTTP requests for OAuth metadata discovery and the delegated SDK auth flow.
+        """
+        async with self.context.lock:
+            if not self._initialized:
+                await self._initialize()
+            self.context.protocol_version = request.headers.get(MCP_PROTOCOL_VERSION)
+            if (
+                not self.context.is_token_valid()
+                and self.context.can_refresh_token()
+                and self.context.oauth_metadata is None
+            ):
+                # Pre-empt the SDK's 401-path discovery so its refresh branch
+                # finds populated `oauth_metadata` and uses the advertised token
+                # endpoint instead of guessing `/token`. The resource-metadata
+                # URL is `None`: no 401 yet, so no `WWW-Authenticate` to read.
+                try:
+                    prm_urls = build_protected_resource_metadata_discovery_urls(
+                        None,
+                        self.context.server_url,
+                    )
+                    for url in prm_urls:
+                        # ASYNC119: yielding the request to receive its response is
+                        # this auth generator's handshake protocol, not a value
+                        # escaping a context manager.
+                        response = yield create_oauth_metadata_request(url)  # noqa: ASYNC119
+                        prm = await handle_protected_resource_response(response)
+                        if prm is None:
+                            logger.debug(
+                                "Protected resource metadata discovery failed: %s",
+                                url,
+                            )
+                            continue
+                        self.context.protected_resource_metadata = prm
+                        self.context.auth_server_url = str(prm.authorization_servers[0])
+                        break
+
+                    asm_urls = build_oauth_authorization_server_metadata_discovery_urls(
+                        self.context.auth_server_url,
+                        self.context.server_url,
+                    )
+                    for url in asm_urls:
+                        # ASYNC119: yielding the request to receive its response is
+                        # this auth generator's handshake protocol, not a value
+                        # escaping a context manager.
+                        response = yield create_oauth_metadata_request(url)  # noqa: ASYNC119
+                        ok, metadata = await handle_auth_metadata_response(response)
+                        if not ok:
+                            break
+                        if metadata is None:
+                            logger.debug("OAuth metadata discovery failed: %s", url)
+                            continue
+                        self.context.oauth_metadata = metadata
+                        await self._persist_oauth_metadata()
+                        break
+                except httpx.HTTPError as exc:
+                    # Log only the exception type, never its payload — discovery
+                    # responses travel the same channel as bearer tokens.
+                    logger.debug(
+                        "Pre-emptive OAuth metadata discovery for %s raised %s; "
+                        "deferring to the SDK auth flow.",
+                        self.context.server_url,
+                        type(exc).__name__,
+                    )
+
+        # Delegate to the SDK flow by manually pumping the inner generator so
+        # the HTTP responses httpx feeds back via `auth_flow.asend(response)`
+        # are forwarded into it. A plain `async for` would advance the inner
+        # generator with `__anext__()` (i.e. `asend(None)`), discarding every
+        # response — the SDK's `response = yield request` and refresh-path
+        # `yield refresh_request` would then see `None` and raise
+        # `AttributeError: 'NoneType' object has no attribute 'status_code'`,
+        # surfacing as the `ExceptionGroup` users hit on MCP OAuth login.
+        # httpx primes the flow with `__anext__()`, then drives it with
+        # `asend`/`aclose` (never `athrow`), so forwarding sent values and
+        # closing the inner generator on `GeneratorExit` is sufficient — no
+        # `athrow` forwarding needed.
+        inner = super().async_auth_flow(request)
+        try:
+            # Prime with `anext()` (no response to send yet); thereafter every
+            # resume carries httpx's response back in via `asend`.
+            flow_request = await anext(inner)
+            while True:
+                response = yield flow_request
+                flow_request = await inner.asend(response)
+        except StopAsyncIteration:
+            return
+        finally:
+            await inner.aclose()
+
+
 def build_oauth_provider(
     *,
     server_name: str,
@@ -444,6 +1231,7 @@ def build_oauth_provider(
     storage: TokenStorage,
     extra_auth_params: dict[str, str] | None = None,
     interactive: bool = True,
+    ui: OAuthInteraction | None = None,
 ) -> OAuthClientProvider:
     """Construct an `OAuthClientProvider` for an MCP server.
 
@@ -453,22 +1241,72 @@ def build_oauth_provider(
         storage: Token storage implementation for this server.
         extra_auth_params: Optional query params for the interactive auth URL.
         interactive: Whether the provider may prompt on stdin.
+        ui: Interaction surface used for URL display and paste-back
+            input in interactive mode.
 
     Returns:
         A configured `OAuthClientProvider`.
     """
+    from deepagents_code.mcp_providers import resolve_provider
+
+    policy = resolve_provider(server_url)
+    redirect_uri: str | None = None
+
     if interactive:
-        redirect, callback = _make_paste_back_handlers(
-            extra_auth_params=extra_auth_params
-        )
+        if policy.supports_loopback_callback():
+            fixed = policy.loopback_port()
+            if fixed is not None:
+                port = fixed
+            else:
+                # Reuse the port from a prior DCR registration when available,
+                # so the authorize request's redirect_uri matches what was
+                # registered against the persisted client_id. A fresh random
+                # port on every launch would otherwise invalidate the URI on
+                # the second run and force the server to reject the request.
+                stored = (
+                    storage.stored_loopback_port()
+                    if isinstance(storage, FileTokenStorage)
+                    else None
+                )
+                # No reusable port means any persisted registration can't be
+                # paired with the random loopback port we're about to bind. Drop
+                # a stale registration so the handshake re-runs DCR with a
+                # matching redirect URI instead of failing with "invalid or
+                # missing redirect_uri".
+                if (
+                    stored is None
+                    and isinstance(storage, FileTokenStorage)
+                    and storage.discard_client_info_if_loopback_unusable()
+                ):
+                    logger.info(
+                        "Discarded a stale MCP client registration for %s "
+                        "whose redirect URI can't serve loopback login; the "
+                        "handshake will register a fresh client.",
+                        server_name,
+                    )
+                port = stored if stored is not None else _choose_loopback_port()
+            callback_server = _LoopbackOAuthCallbackServer(port=port)
+            redirect_uri = callback_server.redirect_uri
+            redirect, callback = _make_loopback_handlers(
+                callback_server=callback_server,
+                extra_auth_params=extra_auth_params,
+                ui=ui,
+            )
+        else:
+            redirect, callback = _make_paste_back_handlers(
+                extra_auth_params=extra_auth_params,
+                ui=ui,
+            )
     else:
         redirect, callback = _make_reauth_required_handlers(server_name=server_name)
 
-    from deepagents_code.mcp_providers import resolve_provider
+    metadata = (
+        policy.client_metadata(redirect_uri=redirect_uri)
+        if redirect_uri is not None
+        else policy.client_metadata()
+    )
 
-    metadata = resolve_provider(server_url).client_metadata()
-
-    return OAuthClientProvider(
+    return _ExpiryAwareOAuthClientProvider(
         server_url=server_url,
         client_metadata=metadata,
         storage=storage,
@@ -483,6 +1321,7 @@ async def _run_device_flow(
     token_url: str,
     client_id: str,
     scope: str | None = None,
+    ui: OAuthInteraction | None = None,
 ) -> OAuthToken:
     """Run OAuth 2.0 Device Authorization Grant and return the token.
 
@@ -491,6 +1330,7 @@ async def _run_device_flow(
         token_url: Provider endpoint to poll for the access token.
         client_id: Registered OAuth client ID.
         scope: Optional space-delimited scope string.
+        ui: Interaction surface used to display the device code.
 
     Returns:
         The issued OAuth access token payload.
@@ -502,6 +1342,8 @@ async def _run_device_flow(
     import asyncio
 
     import httpx
+
+    interaction = ui if ui is not None else _default_ui()
 
     init_data = {"client_id": client_id}
     if scope is not None:
@@ -530,9 +1372,10 @@ async def _run_device_flow(
             )
             raise RuntimeError(msg) from exc
 
-        print(  # noqa: T201
-            f"\nVisit {device.verification_uri} and enter code: "
-            f"{device.user_code}\n(code expires in {device.expires_in}s)\n"
+        await interaction.show_device_code(
+            verification_uri=device.verification_uri,
+            user_code=device.user_code,
+            expires_in=device.expires_in,
         )
 
         interval = max(device.interval, 1)
@@ -554,7 +1397,15 @@ async def _run_device_flow(
             # before raise_for_status so 400-returning providers work.
             try:
                 body = token_response.json()
-            except ValueError:
+            except ValueError as exc:
+                # Malformed JSON would otherwise cascade into a confusing
+                # OAuthToken.model_validate({}) error below; log the cause
+                # explicitly so debugging is possible.
+                logger.warning(
+                    "Token endpoint %s returned non-JSON body: %s",
+                    token_url,
+                    exc,
+                )
                 body = {}
             err = body.get("error")
             if err == "authorization_pending":
@@ -582,8 +1433,51 @@ async def _run_device_flow(
                 )
                 raise RuntimeError(msg) from exc
 
-    msg = "Device flow timed out; re-run `deepagents mcp login <server>`."
+    msg = "Device flow timed out. Try logging in again."
     raise RuntimeError(msg)
+
+
+def format_login_failure(exc: BaseException) -> str:
+    """Return a token-safe single-line summary of an OAuth-login exception.
+
+    OAuth handshakes commonly surface as `ExceptionGroup` (anyio task
+    groups) or as MCP-SDK errors whose `args`/`repr` may include an
+    `OAuthToken`. Never call `str()`/`repr()` on the raw exception for
+    display or logging — instead, prefer a known-safe nested
+    `MCPReauthRequiredError` message, fall back to the messages of our
+    own loopback-related exception types, and degrade to a class-name
+    chain for anything else.
+
+    Args:
+        exc: Root exception caught from the login worker.
+
+    Returns:
+        A user-displayable string that is safe to log and to render.
+    """
+    reauth = find_reauth_required(exc)
+    if reauth is not None:
+        return str(reauth)
+
+    safe_types = (
+        _LoopbackCallbackTimeoutError,
+        _LoopbackCallbackUnavailableError,
+    )
+    if isinstance(exc, safe_types):
+        return f"{type(exc).__name__}: {exc}"
+
+    parts: list[str] = []
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        parts.append(type(current).__name__)
+        if isinstance(current, BaseExceptionGroup):
+            parts.append(
+                "[" + ", ".join(type(e).__name__ for e in current.exceptions[:5]) + "]"
+            )
+            break
+        current = current.__cause__ or current.__context__
+    return " -> ".join(parts) if parts else type(exc).__name__
 
 
 def find_reauth_required(exc: BaseException) -> MCPReauthRequiredError | None:
@@ -607,9 +1501,8 @@ def find_reauth_required(exc: BaseException) -> MCPReauthRequiredError | None:
         visited.add(id(current))
         if isinstance(current, MCPReauthRequiredError):
             return current
-        sub_exceptions = getattr(current, "exceptions", None)
-        if sub_exceptions:
-            stack.extend(sub_exceptions)
+        if isinstance(current, BaseExceptionGroup):
+            stack.extend(current.exceptions)
         cause = current.__cause__ or current.__context__
         if cause is not None:
             stack.append(cause)
@@ -630,12 +1523,15 @@ async def login(
     *,
     server_name: str,
     server_config: McpServerSpec,
+    ui: OAuthInteraction,
 ) -> None:
     """Drive OAuth login for `server_name`, persisting tokens on success.
 
     Args:
         server_name: Name of the configured MCP server.
         server_config: Parsed server config for that entry.
+        ui: Interaction surface for all user prompts and progress messages
+            during the flow.
 
     Raises:
         ValueError: If `server_config` isn't an OAuth http/sse server.
@@ -672,12 +1568,15 @@ async def login(
         server_name=server_name,
         server_url=server_config["url"],
         storage=storage,
+        ui=ui,
+    )
+
+    success_message = (
+        f"Logged in to MCP server '{server_name}'. Tokens saved to {storage.path}."
     )
 
     if result.completed:
-        print(  # noqa: T201
-            f"Logged in to MCP server '{server_name}'. Tokens saved to {storage.path}."
-        )
+        await ui.show_success(success_message)
         return
 
     provider = build_oauth_provider(
@@ -685,6 +1584,7 @@ async def login(
         server_url=server_config["url"],
         storage=storage,
         extra_auth_params=result.extra_auth_params or None,
+        ui=ui,
     )
     conn: StreamableHttpConnection | SSEConnection
     if transport == "http":
@@ -707,6 +1607,4 @@ async def login(
         )
 
     await _drive_handshake({server_name: conn})
-    print(  # noqa: T201
-        f"Logged in to MCP server '{server_name}'. Tokens saved to {storage.path}."
-    )
+    await ui.show_success(success_message)
