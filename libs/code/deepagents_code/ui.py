@@ -445,6 +445,44 @@ def show_update_help() -> None:
     console.print()
 
 
+def show_login_help() -> None:
+    """Show help information for the `login` subcommand."""
+    console.print()
+    console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode login <provider> [options]")
+    console.print()
+    console.print("[bold]Providers:[/bold]", style=theme.PRIMARY)
+    console.print(
+        "  openai            Log in with a ChatGPT Plus/Pro subscription (OpenAI OAuth)"
+    )
+    console.print()
+    _print_option_section(
+        "  --headless              Use device-code flow instead of browser "
+        "redirect (for headless env)",
+    )
+    console.print()
+    console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode login openai")
+    console.print("  dcode login openai --headless")
+    console.print()
+
+
+def show_logout_help() -> None:
+    """Show help information for the `logout` subcommand."""
+    console.print()
+    console.print("[bold]Usage:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode logout <provider>")
+    console.print()
+    console.print("[bold]Providers:[/bold]", style=theme.PRIMARY)
+    console.print("  openai            Remove stored ChatGPT OAuth tokens")
+    console.print()
+    _print_option_section()
+    console.print()
+    console.print("[bold]Examples:[/bold]", style=theme.PRIMARY)
+    console.print("  dcode logout openai")
+    console.print()
+
+
 def _print_mcp_discovery_paths() -> None:
     """Print the auto-discovered MCP config paths in precedence order."""
     from deepagents_code.mcp_tools import MCP_CONFIG_DISCOVERY_PATHS

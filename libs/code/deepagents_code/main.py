@@ -747,6 +747,8 @@ _HELP_SPECS: dict[str, tuple[str | None, str]] = {
     "threads": ("threads_command", "show_threads_help"),
     "mcp": ("mcp_command", "show_mcp_help"),
     "config": ("config_command", "show_config_help"),
+    "login": ("login_provider", "show_login_help"),
+    "logout": ("logout_provider", "show_logout_help"),
 }
 """Maps top-level command names to their startup-fast-path help dispatch.
 
