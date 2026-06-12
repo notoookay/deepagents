@@ -3388,6 +3388,29 @@ models = ["llama3"]
         assert status.state is ProviderAuthState.UNKNOWN
         assert status.env_var == "OLLAMA_API_KEY"
 
+    def test_chatgpt_logged_in_returns_configured_status(self) -> None:
+        """ChatGPT token presence returns a structured configured status."""
+        with patch(
+            "deepagents._chatgpt_auth.load_tokens",
+            return_value={"access_token": "x"},
+        ):
+            status = get_provider_auth_status("chatgpt")
+            legacy = has_provider_credentials("chatgpt")
+
+        assert status.state is ProviderAuthState.CONFIGURED
+        assert status.source is ProviderAuthSource.STORED
+        assert legacy is True
+
+    def test_chatgpt_logged_out_returns_structured_unknown_status(self) -> None:
+        """ChatGPT token absence must not return a raw bool to UI callers."""
+        with patch("deepagents._chatgpt_auth.load_tokens", return_value=None):
+            status = get_provider_auth_status("chatgpt")
+            legacy = has_provider_credentials("chatgpt")
+
+        assert status.state is ProviderAuthState.UNKNOWN
+        assert status.detail == "run `deepagents-code login openai`"
+        assert legacy is None
+
 
 class TestProviderAuthStatusMissingDetail:
     """Tests for ProviderAuthStatus.missing_detail() rendering."""
@@ -4522,6 +4545,9 @@ recent = "openai:gpt-5.2"
             patch("deepagents_code.auth_store.get_stored_key", return_value=None),
             patch.object(settings, "openai_api_key", None),
             patch.object(settings, "anthropic_api_key", "test-key"),
+            # `has_chatgpt` reads OAuth tokens from disk; isolate the test
+            # from the developer's real login state.
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
             patch.dict(
                 "os.environ",
                 {"ANTHROPIC_API_KEY": "test-key"},
@@ -4545,6 +4571,9 @@ recent = "openai:gpt-5.2"
         with (
             patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
             patch("deepagents_code.auth_store.get_stored_key", side_effect=stored_key),
+            # `has_chatgpt` reads OAuth tokens from disk; isolate the test
+            # from the developer's real login state.
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
             patch.dict("os.environ", {}, clear=True),
         ):
             result = _get_default_model_spec()
@@ -4568,6 +4597,7 @@ recent = "openai:gpt-5.2"
             patch.object(settings, "google_api_key", None),
             patch.object(settings, "google_cloud_project", "test-project"),
             patch.object(settings, "nvidia_api_key", None),
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
             pytest.raises(ModelConfigError),
         ):
             _get_default_model_spec()
@@ -4589,6 +4619,7 @@ recent = "openai:gpt-5.2"
             patch.object(settings, "google_api_key", None),
             patch.object(settings, "google_cloud_project", None),
             patch.object(settings, "nvidia_api_key", "test-key"),
+            patch("deepagents._chatgpt_auth.load_tokens", return_value=None),
             pytest.raises(ModelConfigError),
         ):
             _get_default_model_spec()

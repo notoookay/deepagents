@@ -1734,6 +1734,13 @@ class Settings:
         return self._format_reload_changes(previous, refreshed)
 
     @property
+    def has_chatgpt(self) -> bool:
+        """Check if ChatGPT subscription OAuth tokens are stored."""
+        from deepagents._chatgpt_auth import load_tokens  # noqa: PLC2701
+
+        return load_tokens() is not None
+
+    @property
     def has_openai(self) -> bool:
         """Check if OpenAI API key is configured."""
         return self.openai_api_key is not None
@@ -2471,6 +2478,9 @@ def detect_provider(model_name: str) -> str | None:
     """
     model_lower = model_name.lower()
 
+    if model_lower.startswith("chatgpt:"):
+        return "chatgpt"
+
     if model_lower.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
         return "openai"
 
@@ -2529,6 +2539,10 @@ def _get_default_model_spec() -> str:
     # implicit-auth provider (e.g., Vertex ADC) is added to this fallback
     # list, switch to checking `state` against the relevant
     # `ProviderAuthState` members directly.
+    if get_provider_auth_status("chatgpt").as_legacy_bool() is True:
+        from deepagents._chatgpt_model import DEFAULT_CHATGPT_MODEL  # noqa: PLC2701
+
+        return f"chatgpt:{DEFAULT_CHATGPT_MODEL}"
     if get_provider_auth_status("openai").as_legacy_bool() is True:
         return "openai:gpt-5.5"
     if get_provider_auth_status("anthropic").as_legacy_bool() is True:
@@ -3044,6 +3058,30 @@ def create_model(
         # state. Diagnostic only -- never alters resolution.
         warn_on_split_credential_source(provider)
         apply_stored_credentials(provider)
+
+    # ChatGPT subscription — bypass init_chat_model entirely
+    if provider == "chatgpt":
+        from deepagents._chatgpt_model import _build_chatcodex  # noqa: PLC2701
+
+        chatgpt_kwargs: dict[str, Any] = {}
+        if extra_kwargs:
+            chatgpt_kwargs.update(extra_kwargs)
+        model = _build_chatcodex(model=model_name, **chatgpt_kwargs)
+
+        if profile_overrides:
+            _apply_profile_overrides(
+                model,
+                profile_overrides,
+                model_name,
+                label="CLI --profile-override",
+                raise_on_failure=True,
+            )
+
+        return ModelResult(
+            model=model,
+            model_name=model_name,
+            provider="chatgpt",
+        )
 
     # Early credential check — fail fast with an actionable message instead of
     # letting the provider SDK raise an opaque auth error on first invocation.

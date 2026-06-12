@@ -1,6 +1,10 @@
 # Creates release PRs based on conventional commits.
 #
-# When commits land on main, this workflow either:
+# This fork does not publish packages, so the workflow is kept for reference
+# but disabled for automatic pushes. Run it manually only if release
+# automation is needed again.
+#
+# When enabled for main pushes, this workflow either:
 # - Creates/updates a release PR with changelog and version bump
 # - When a release PR is merged, triggers the release workflow
 #
@@ -10,9 +14,7 @@
 name: "⚠️ (Automated) Release Please"
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 # Do not put workflow-level concurrency here. Release commits must be able to
 # reach `trigger-releases` even while a normal push is waiting out an in-flight
