@@ -2,7 +2,7 @@
 
 `deepagents-code` is the interactive coding agent — the Textual REPL, headless `-x` mode, MCP integration, skills, sandbox bootstrap, and slash-command surface. Forked from `deepagents-cli` at the 0.1.0 split.
 
-For monorepo-wide conventions (commit titles, lint, testing, docs, CI, benchmarks), see the root `AGENTS.md`.
+For monorepo-wide conventions (commit titles, lint, testing, docs, CI, benchmarks), see the root `AGENTS.md`. For a high-level map of the package (client/server processes, request lifecycle, module map), see `ARCHITECTURE.md`.
 
 ## Textual (terminal UI framework)
 
@@ -115,7 +115,7 @@ dcode-dev --version
 - To read another package's version without importing it, use `importlib.metadata.version("package-name")`.
 - Feature-gate checks on the startup hot path (before background workers fire) must be lightweight — env var lookups, small file reads. Never pull in expensive modules just to decide whether to skip a feature.
 - When adding logic that already exists elsewhere (e.g., editable-install detection), import the existing cached implementation rather than duplicating it.
-- Features that run shell commands silently must be opt-in, never default-enabled. Gate behind an explicit env var or config key.
+- Features that run shell commands must never do so *silently* by default. Either gate them behind an explicit env var or config key (opt-in), or — if default-enabled — announce the action before running it and offer a documented opt-out. Auto-update is the sole default-enabled exception: it shows a one-time migration notice and skips the first install when enabled only by the opt-out default, prints the upgrade it is about to perform, is overridable via `DEEPAGENTS_CODE_AUTO_UPDATE` / `[update].auto_update`, and is always disabled for editable installs.
 - Background workers that spawn subprocesses must set a timeout to avoid blocking indefinitely.
 
 ## Logging
@@ -124,7 +124,7 @@ Debug logging is configured **once**, on the `deepagents_code` package logger, b
 
 - Do **not** add per-module `configure_debug_logging(logger)` calls. They are redundant now that the package logger is configured at import, and they reintroduce the duplicate-handler problem the single-config approach solves.
 - Every module should create its logger with `logging.getLogger(__name__)` so it stays inside the `deepagents_code.*` hierarchy and inherits the package handler. Don't set `logger.propagate = False` or attach your own handlers.
-- The handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy; the no-op path is a single env-var read, so it's safe on the startup hot path. See `DEV.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_FILE` env vars.
+- The handler only attaches when `DEEPAGENTS_CODE_DEBUG` is truthy; the no-op path is a single env-var read, so it's safe on the startup hot path. See `DEVELOPMENT.md` for the `DEEPAGENTS_CODE_DEBUG` / `DEEPAGENTS_CODE_DEBUG_FILE` env vars.
 
 ## CLI help screen
 
@@ -138,7 +138,7 @@ When adding a user-facing CLI feature (new slash command, keybinding, workflow),
 
 Slash commands are defined as `SlashCommand` entries in the `COMMANDS` tuple in `deepagents_code/command_registry.py`. Each entry declares the command name, description, `bypass_tier` (queue-bypass classification), optional `hidden_keywords` for fuzzy matching, and optional `aliases`. Bypass-tier frozensets and the `SLASH_COMMANDS` autocomplete list are derived automatically — no other file should hard-code command metadata.
 
-To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) set the appropriate `bypass_tier`, (3) add a handler branch in `_handle_command` in `app.py`, (4) run `make lint && make test` — the drift test will catch any mismatch.
+To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) set the appropriate `bypass_tier`, (3) add a handler branch in `_handle_command` in `app.py`, (4) run `make commands-catalog` if you changed command names, aliases, descriptions, visibility, or hidden-command metadata, then (5) run `make lint && make test` — the drift test will catch any mismatch.
 
 ## Adding a new model provider
 
@@ -148,7 +148,8 @@ To add a new slash command: (1) add a `SlashCommand` entry to `COMMANDS`, (2) se
 2. `deepagents_code/model_config.py` — if the provider reads a *dedicated* endpoint env var, add `"provider_name": ("CANONICAL_BASE_URL", "ALTERNATE", ...)` to `PROVIDER_BASE_URL_ENV` (see guidelines below); omit the provider entirely when it has no provider-specific endpoint variable
 3. `pyproject.toml` — add `provider = ["langchain-provider>=X.Y.Z,<N.0.0"]` to `[project.optional-dependencies]` and include it in the `all-providers` composite extra
 4. `deepagents_code/model_config.py` — add `"provider_name"` to `RETRY_PARAM_BY_PROVIDER` if the provider's chat model accepts `max_retries`
-5. `tests/unit_tests/test_model_config.py` — add `assert PROVIDER_API_KEY_ENV["provider_name"] == "ENV_VAR_NAME"` to `TestProviderApiKeyEnv.test_contains_major_providers`, and pin any `PROVIDER_BASE_URL_ENV` entry with a matching assertion
+5. `deepagents_code/widgets/auth.py` — add `"provider_name": "Display Name"` to `PROVIDER_DISPLAY_NAMES` so the `/auth` UI shows a branded label instead of the title-cased key, and (if the provider issues API keys from a self-serve page) `"provider_name": "https://…"` to `PROVIDER_API_KEY_URLS` so the prompt links straight to the key page
+6. `tests/unit_tests/test_model_config.py` — add `assert PROVIDER_API_KEY_ENV["provider_name"] == "ENV_VAR_NAME"` to `TestProviderApiKeyEnv.test_contains_major_providers`, and pin any `PROVIDER_BASE_URL_ENV` entry with a matching assertion
 
 ### `PROVIDER_BASE_URL_ENV` guidelines
 
